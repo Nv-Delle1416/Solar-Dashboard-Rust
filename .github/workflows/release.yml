@@ -1,0 +1,76 @@
+name: Release
+
+# Cut a release by pushing a version tag, e.g.:
+#   git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & publish (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux
+            os: ubuntu-latest
+            bin: watts-dashboard
+            ext: tar.gz
+          - label: macos
+            os: macos-latest
+            bin: watts-dashboard
+            ext: tar.gz
+          - label: windows
+            os: windows-latest
+            bin: watts-dashboard.exe
+            ext: zip
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ASSET="solar-dashboard-${GITHUB_REF_NAME}-${{ matrix.label }}.${{ matrix.ext }}"
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" dist/
+          cp README.md .env.example seed.sql dist/
+          tar -C dist -czf "$ASSET" .
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $asset = "solar-dashboard-$env:GITHUB_REF_NAME-${{ matrix.label }}.${{ matrix.ext }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${{ matrix.bin }}" dist/
+          Copy-Item README.md,.env.example,seed.sql dist/
+          Compress-Archive -Path dist/* -DestinationPath $asset -Force
+          "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.ASSET }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true

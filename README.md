@@ -171,3 +171,24 @@ Then open the URL printed in the logs (default <http://127.0.0.1:8080>).
 cargo build --release
 ./target/release/watts-dashboard
 ```
+
+## Cutting a release
+
+Pushing a version tag triggers the **Release** workflow
+(`.github/workflows/release.yml`), which builds the binary for Linux, macOS, and
+Windows, bundles each with the `README.md`, `.env.example`, and `seed.sql`, and
+attaches the archives to a new GitHub Release (with auto-generated notes).
+
+```sh
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This publishes:
+
+- `solar-dashboard-v1.0.0-linux.tar.gz`
+- `solar-dashboard-v1.0.0-macos.tar.gz`
+- `solar-dashboard-v1.0.0-windows.zip`
+
+Each archive contains a self-contained binary (the dashboard HTML is embedded at
+compile time), so users only need the binary and a `.env`/`DATABASE_URL` to run.
