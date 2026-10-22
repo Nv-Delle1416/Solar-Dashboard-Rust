@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Solar Energy Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      margin: 0;
+      padding: 1.5rem;
+      background: #0f172a;
+      color: #e2e8f0;
+    }
+    h1 { margin: 0 0 0.25rem; font-size: 1.4rem; }
+    .sub { color: #94a3b8; font-size: 0.9rem; margin-bottom: 1.25rem; }
+    .controls {
+      display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }
+    .ranges { display: inline-flex; border: 1px solid #334155; border-radius: 8px; overflow: hidden; }
+    .ranges button {
+      background: #1e293b; color: #cbd5e1; border: 0; border-right: 1px solid #334155;
+      padding: 0.5rem 0.9rem; font-size: 0.9rem; cursor: pointer;
+    }
+    .ranges button:last-child { border-right: 0; }
+    .ranges button:hover { background: #334155; }
+    .ranges button.active { background: #38bdf8; color: #082f49; font-weight: 600; }
+    button.secondary {
+      background: #1e293b; color: #e2e8f0; border: 1px solid #334155;
+      border-radius: 6px; padding: 0.5rem 0.8rem; font-size: 0.9rem; cursor: pointer;
+    }
+    button.secondary:hover { background: #334155; }
+    .card {
+      background: #1e293b; border: 1px solid #334155; border-radius: 10px;
+      padding: 1rem; margin-bottom: 1rem;
+    }
+    .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+    .stat .value { font-size: 1.3rem; font-weight: 600; }
+    .stat .key { font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; }
+    #status { font-size: 0.85rem; color: #94a3b8; }
+    .error { color: #f87171; }
+    canvas { max-height: 460px; }
+  </style>
+</head>
+<body>
+  <h1>Solar Energy Dashboard</h1>
+  <div class="sub" id="source">Loading configuration…</div>
+
+  <div class="controls">
+    <div class="ranges" id="ranges">
+      <button data-range="day">Day</button>
+      <button data-range="week">Week</button>
+      <button data-range="month">Month</button>
+      <button data-range="year">Year</button>
+      <button data-range="lifetime">Lifetime</button>
+    </div>
+    <button class="secondary" id="refresh">Refresh</button>
+    <span id="status"></span>
+  </div>
+
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="value" id="statTotal">–</div><div class="key">Total kWh</div></div>
+      <div class="stat"><div class="value" id="statPeak">–</div><div class="key">Peak kWh</div></div>
+      <div class="stat"><div class="value" id="statAvg">–</div><div class="key">Average kWh</div></div>
+      <div class="stat"><div class="value" id="statCount">–</div><div class="key" id="countKey">Points</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <canvas id="chart"></canvas>
+  </div>
+
+  <script>
+    let chart;
+    let currentRange = 'day';
+
+    const RANGE_LABEL = {
+      day: 'kWh per interval (last 24h)',
+      week: 'Total kWh per day (last 7 days)',
+      month: 'Total kWh per day (last 30 days)',
+      year: 'Total kWh per month (last 12 months)',
+      lifetime: 'Total kWh per month (all time)',
+    };
+    const COUNT_LABEL = {
+      day: 'Intervals', week: 'Days', month: 'Days', year: 'Months', lifetime: 'Months',
+    };
+
+    async function loadConfig() {
+      try {
+        const c = await (await fetch('/api/config')).json();
+        document.getElementById('source').textContent = c.mock_data
+          ? `Mock data (no database) · time axis: ${c.time_column}`
+          : `Table: ${c.table_name} · time axis: ${c.time_column}`;
+      } catch (e) {
+        document.getElementById('source').textContent = 'Could not load config';
+      }
+    }
+
+    function fmt(n) {
+      if (n === null || n === undefined || Number.isNaN(n)) return '–';
+      return Number(n).toLocaleString(undefined, { maximumFractionDigits: 2 });
+    }
+
+    async function loadData() {
+      const status = document.getElementById('status');
+      status.className = '';
+      status.textContent = 'Loading…';
+      try {
+        const r = await fetch(`/api/data?range=${encodeURIComponent(currentRange)}`);
+        if (!r.ok) {
+          const body = await r.json().catch(() => ({}));
+          throw new Error(body.error || `HTTP ${r.status}`);
+        }
+        const payload = await r.json();
+        render(payload);
+        status.textContent = `Loaded ${payload.points.length} points at ${new Date().toLocaleTimeString()}`;
+      } catch (e) {
+        status.className = 'error';
+        status.textContent = 'Error: ' + e.message;
+      }
+    }
+
+    function render(payload) {
+      const points = payload.points || [];
+      const labels = points.map(p => p.label);
+      const values = points.map(p => p.kwh);
+      const unit = payload.unit || 'kWh';
+
+      const valid = values.filter(v => typeof v === 'number' && !Number.isNaN(v));
+      const total = valid.reduce((a, b) => a + b, 0);
+      const peak = valid.length ? Math.max(...valid) : null;
+      const avg = valid.length ? total / valid.length : null;
+
+      document.getElementById('statTotal').textContent = fmt(total);
+      document.getElementById('statPeak').textContent = fmt(peak);
+      document.getElementById('statAvg').textContent = fmt(avg);
+      document.getElementById('statCount').textContent = fmt(points.length);
+      document.getElementById('countKey').textContent = COUNT_LABEL[currentRange];
+
+      const isLine = payload.chart === 'line';
+      const data = {
+        labels,
+        datasets: [{
+          label: RANGE_LABEL[currentRange] || unit,
+          data: values,
+          borderColor: '#38bdf8',
+          backgroundColor: isLine ? 'rgba(56, 189, 248, 0.15)' : 'rgba(56, 189, 248, 0.65)',
+          borderWidth: isLine ? 2 : 0,
+          pointRadius: 0,
+          tension: 0.25,
+          fill: isLine,
+          borderRadius: isLine ? 0 : 4,
+        }],
+      };
+
+      const options = {
+        responsive: true,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { ticks: { color: '#94a3b8', maxTicksLimit: 16, autoSkip: true }, grid: { color: '#1e293b' } },
+          y: { beginAtZero: true, title: { display: true, text: unit, color: '#cbd5e1' }, ticks: { color: '#94a3b8' }, grid: { color: '#1e293b' } },
+        },
+        plugins: {
+          legend: { labels: { color: '#e2e8f0' } },
+          tooltip: { callbacks: { label: ctx => `${fmt(ctx.parsed.y)} ${unit}` } },
+        },
+      };
+
+      // Chart.js can't switch type in place, so recreate when the kind changes.
+      const kind = isLine ? 'line' : 'bar';
+      if (chart && chart.config.type !== kind) { chart.destroy(); chart = null; }
+      if (chart) {
+        chart.data = data;
+        chart.options = options;
+        chart.update();
+      } else {
+        chart = new Chart(document.getElementById('chart'), { type: kind, data, options });
+      }
+    }
+
+    document.getElementById('ranges').addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-range]');
+      if (!btn) return;
+      currentRange = btn.dataset.range;
+      document.querySelectorAll('#ranges button').forEach(b =>
+        b.classList.toggle('active', b === btn));
+      loadData();
+    });
+    document.getElementById('refresh').addEventListener('click', loadData);
+
+    // Default selection: Day
+    document.querySelector('#ranges button[data-range="day"]').classList.add('active');
+    loadConfig();
+    loadData();
+  </script>
+</body>
+</html>
