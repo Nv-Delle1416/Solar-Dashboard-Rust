@@ -52,6 +52,76 @@ cp .env.example .env
 > identifiers (letters, digits, underscore) to prevent injection, since
 > identifiers cannot be passed as bound query parameters.
 
+## Database connection & authentication
+
+Database authentication is handled entirely through the `DATABASE_URL`
+connection string — there is **no interactive password prompt**. Whatever
+credentials are in the URL are what the app uses to authenticate against
+MySQL/MariaDB. The URL format is:
+
+```
+mysql://USER:PASSWORD@HOST:PORT/DATABASE
+```
+
+For example:
+
+```
+mysql://solar_ro:s3cret@db.example.com:3306/solar
+```
+
+### Passwords with special characters
+
+If your password contains URL-reserved characters (`@ : / ? # [ ] %` …) you
+**must percent-encode them**, otherwise the URL parses incorrectly. For example,
+the password `p@ss:word/1` becomes:
+
+```
+mysql://user:p%40ss%3Aword%2F1@host:3306/db
+```
+
+Common encodings: `@` → `%40`, `:` → `%3A`, `/` → `%2F`, `#` → `%23`,
+`?` → `%3F`, `%` → `%25`.
+
+### Authentication plugins
+
+Both MySQL authentication plugins are supported out of the box:
+
+- `mysql_native_password`
+- `caching_sha2_password` (the default on MySQL 8+) — this also works over a
+  non-TLS connection via RSA key exchange.
+
+### TLS / encrypted connections
+
+The binary is built with TLS support (`tls-rustls`). To require an encrypted
+connection, add an `ssl-mode` query parameter:
+
+```
+mysql://user:pass@host:3306/db?ssl-mode=REQUIRED
+```
+
+### What happens on an authentication failure
+
+The database connection is established **once at startup**. If the credentials
+are rejected (or the host is unreachable), the app does **not** retry and does
+**not** start the web server — it exits immediately with an error such as:
+
+```
+Error: failed to connect to MySQL database
+
+Caused by:
+    Access denied for user 'user'@'host' (using password: YES)
+```
+
+Fix the credentials in `DATABASE_URL` and start the app again. (In
+[mock mode](#mock-data-no-database) the database is skipped entirely, so no
+credentials are needed.)
+
+### Keeping credentials out of version control
+
+`DATABASE_URL` is read from the environment or a local `.env` file. The `.env`
+file is listed in `.gitignore`, so your real credentials are never committed —
+only `.env.example` (which contains placeholders) is tracked.
+
 ## Mock data (no database)
 
 The quickest way to preview the dashboard is mock mode: the server generates a
