@@ -46,26 +46,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked
 
-      - name: Package (Unix)
+      - name: Name the binary (Unix)
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          ASSET="solar-dashboard-${GITHUB_REF_NAME}-${{ matrix.label }}.${{ matrix.ext }}"
-          mkdir -p dist
-          cp "target/release/${{ matrix.bin }}" dist/
-          cp README.md .env.example seed.sql dist/
-          tar -C dist -czf "$ASSET" .
+          ASSET="solar-dashboard-${GITHUB_REF_NAME}-${{ matrix.label }}${{ matrix.suffix }}"
+          cp "target/release/${{ matrix.bin }}" "$ASSET"
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
-      - name: Package (Windows)
+      - name: Name the binary (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $asset = "solar-dashboard-$env:GITHUB_REF_NAME-${{ matrix.label }}.${{ matrix.ext }}"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item "target/release/${{ matrix.bin }}" dist/
-          Copy-Item README.md,.env.example,seed.sql dist/
-          Compress-Archive -Path dist/* -DestinationPath $asset -Force
+          $asset = "solar-dashboard-$env:GITHUB_REF_NAME-${{ matrix.label }}${{ matrix.suffix }}"
+          Copy-Item "target/release/${{ matrix.bin }}" $asset
           "ASSET=$asset" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Publish to GitHub Release

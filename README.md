@@ -177,19 +177,20 @@ cargo build --release
 
 Pushing a version tag triggers the **Release** workflow
 (`.github/workflows/release.yml`), which builds the binary for Linux, macOS, and
-Windows, bundles each with the `README.md`, `.env.example`, and `seed.sql`, and
-attaches the archives to a new GitHub Release (with auto-generated notes).
+Windows and attaches the **raw executables** to a new GitHub Release (with
+auto-generated notes).
 
 ```sh
 git tag v1.0.0
 git push origin v1.0.0
 ```
 
-This publishes:
+This publishes directly-runnable binaries:
 
-- `solar-dashboard-v1.0.0-linux.tar.gz`
-- `solar-dashboard-v1.0.0-macos.tar.gz`
-- `solar-dashboard-v1.0.0-windows.zip`
+- `solar-dashboard-v1.0.0-linux`
+- `solar-dashboard-v1.0.0-macos`
+- `solar-dashboard-v1.0.0-windows.exe`
 
-Each archive contains a self-contained binary (the dashboard HTML is embedded at
-compile time), so users only need the binary and a `.env`/`DATABASE_URL` to run.
+Each binary is self-contained (the dashboard HTML is embedded at compile time),
+so users only need the executable and a `.env`/`DATABASE_URL` to run. On
+Linux/macOS, mark it executable after download: `chmod +x solar-dashboard-*`.
