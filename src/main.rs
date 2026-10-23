@@ -426,3 +426,194 @@ impl IntoResponse for ApiError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dt(y: i32, m: u32, d: u32, h: u32, min: u32) -> NaiveDateTime {
+        NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(h, min, 0)
+            .unwrap()
+    }
+
+    // ---- validate_identifier ------------------------------------------------
+
+    #[test]
+    fn identifier_accepts_plain_names() {
+        for s in ["readings", "invertertime", "col_1", "A1_b2"] {
+            assert!(validate_identifier(s).is_ok(), "should accept {s}");
+        }
+    }
+
+    #[test]
+    fn identifier_rejects_injection_and_empty() {
+        for s in ["", "a b", "drop;", "tbl-1", "`x`", "a.b", "x'y"] {
+            assert!(validate_identifier(s).is_err(), "should reject {s:?}");
+        }
+    }
+
+    // ---- Range --------------------------------------------------------------
+
+    #[test]
+    fn range_parse_known_values() {
+        assert_eq!(Range::parse("day"), Range::Day);
+        assert_eq!(Range::parse("week"), Range::Week);
+        assert_eq!(Range::parse("month"), Range::Month);
+        assert_eq!(Range::parse("year"), Range::Year);
+        assert_eq!(Range::parse("lifetime"), Range::Lifetime);
+        assert_eq!(Range::parse("all"), Range::Lifetime);
+    }
+
+    #[test]
+    fn range_parse_is_case_insensitive_and_trims() {
+        assert_eq!(Range::parse("  WEEK "), Range::Week);
+        assert_eq!(Range::parse("Year"), Range::Year);
+    }
+
+    #[test]
+    fn range_parse_unknown_defaults_to_day() {
+        assert_eq!(Range::parse(""), Range::Day);
+        assert_eq!(Range::parse("nonsense"), Range::Day);
+    }
+
+    #[test]
+    fn range_chart_kind() {
+        assert_eq!(Range::Day.chart_kind(), "line");
+        for r in [Range::Week, Range::Month, Range::Year, Range::Lifetime] {
+            assert_eq!(r.chart_kind(), "bar");
+        }
+    }
+
+    // ---- round2 -------------------------------------------------------------
+
+    #[test]
+    fn round2_rounds_to_two_places() {
+        assert_eq!(round2(1.234), 1.23);
+        assert_eq!(round2(1.235), 1.24);
+        assert_eq!(round2(0.0), 0.0);
+        assert_eq!(round2(13.0), 13.0);
+    }
+
+    // ---- build_sql ----------------------------------------------------------
+
+    #[test]
+    fn sql_reads_wattsperhour_not_watts() {
+        for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
+            let sql = build_sql(r, "readings", "invertertime");
+            assert!(sql.contains("wattsperhour"), "{r:?} should use wattsperhour");
+            assert!(!sql.contains("CAST(Watts"), "{r:?} must not use the Watts column");
+        }
+    }
+
+    #[test]
+    fn sql_interpolates_table_and_time_column() {
+        let sql = build_sql(Range::Week, "my_table", "ts_col");
+        assert!(sql.contains("`my_table`"));
+        assert!(sql.contains("`ts_col`"));
+    }
+
+    #[test]
+    fn sql_day_is_raw_with_limit() {
+        let sql = build_sql(Range::Day, "readings", "invertertime");
+        assert!(sql.contains("INTERVAL 1 DAY"));
+        assert!(sql.contains("LIMIT ?"));
+        assert!(!sql.contains("GROUP BY"), "day view should not aggregate");
+    }
+
+    #[test]
+    fn sql_week_and_month_group_by_day_with_window() {
+        let week = build_sql(Range::Week, "readings", "invertertime");
+        assert!(week.contains("INTERVAL 7 DAY"));
+        assert!(week.contains("GROUP BY DATE(`invertertime`)"));
+        assert!(week.contains("SUM("));
+
+        let month = build_sql(Range::Month, "readings", "invertertime");
+        assert!(month.contains("INTERVAL 30 DAY"));
+    }
+
+    #[test]
+    fn sql_year_windows_one_year_and_groups_by_month() {
+        let sql = build_sql(Range::Year, "readings", "invertertime");
+        assert!(sql.contains("INTERVAL 1 YEAR"));
+        assert!(sql.contains("MONTH(`invertertime`)"));
+    }
+
+    #[test]
+    fn sql_lifetime_has_no_time_filter() {
+        let sql = build_sql(Range::Lifetime, "readings", "invertertime");
+        assert!(!sql.contains("WHERE"), "lifetime should scan all rows");
+        assert!(sql.contains("GROUP BY YEAR"));
+    }
+
+    // ---- mock model ---------------------------------------------------------
+
+    #[test]
+    fn mock_watts_zero_overnight_positive_midday() {
+        assert_eq!(mock_watts(dt(2026, 6, 21, 2, 0)), 0.0);
+        assert_eq!(mock_watts(dt(2026, 6, 21, 23, 0)), 0.0);
+        assert!(mock_watts(dt(2026, 6, 21, 12, 0)) > 0.0);
+    }
+
+    #[test]
+    fn mock_watts_summer_exceeds_winter_at_noon() {
+        let summer = mock_watts(dt(2026, 6, 21, 12, 0));
+        let winter = mock_watts(dt(2026, 12, 21, 12, 0));
+        assert!(summer > winter, "summer {summer} should beat winter {winter}");
+    }
+
+    #[test]
+    fn mock_interval_kwh_scales_with_interval() {
+        let ts = dt(2026, 6, 21, 12, 0);
+        let fifteen = mock_interval_kwh(ts, 15.0);
+        let thirty = mock_interval_kwh(ts, 30.0);
+        assert!((thirty - 2.0 * fifteen).abs() < 1e-9);
+    }
+
+    #[test]
+    fn mock_day_kwh_is_positive() {
+        assert!(mock_day_kwh(NaiveDate::from_ymd_opt(2026, 6, 21).unwrap(), 15.0) > 0.0);
+    }
+
+    #[test]
+    fn generate_mock_point_counts_per_range() {
+        assert_eq!(generate_mock(Range::Day, 15.0, 96).len(), 96);
+        assert_eq!(generate_mock(Range::Week, 15.0, 1000).len(), 7);
+        assert_eq!(generate_mock(Range::Month, 15.0, 1000).len(), 30);
+        assert_eq!(generate_mock(Range::Year, 15.0, 1000).len(), 12);
+        assert_eq!(generate_mock(Range::Lifetime, 15.0, 1000).len(), 18);
+    }
+
+    #[test]
+    fn generate_mock_day_limit_is_clamped() {
+        assert_eq!(generate_mock(Range::Day, 15.0, 0).len(), 1);
+        assert_eq!(generate_mock(Range::Day, 15.0, 10_000).len(), 5000);
+    }
+
+    #[test]
+    fn generate_mock_values_are_finite_and_nonnegative() {
+        for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
+            for p in generate_mock(r, 15.0, 1000) {
+                assert!(p.kwh.is_finite() && p.kwh >= 0.0, "{r:?} -> {p:?}");
+                assert!(!p.label.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn generate_mock_day_labels_are_hh_mm() {
+        for p in generate_mock(Range::Day, 15.0, 96) {
+            assert_eq!(p.label.len(), 5, "expected HH:MM, got {}", p.label);
+            assert_eq!(p.label.as_bytes()[2], b':');
+        }
+    }
+
+    #[test]
+    fn generate_mock_month_labels_are_year_month() {
+        for p in generate_mock(Range::Lifetime, 15.0, 1000) {
+            assert_eq!(p.label.len(), 7, "expected YYYY-MM, got {}", p.label);
+            assert_eq!(p.label.as_bytes()[4], b'-');
+        }
+    }
+}
