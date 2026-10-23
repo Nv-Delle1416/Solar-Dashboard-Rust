@@ -24,15 +24,15 @@ jobs:
           - label: linux
             os: ubuntu-latest
             bin: watts-dashboard
-            ext: tar.gz
+            suffix: ""
           - label: macos
             os: macos-latest
             bin: watts-dashboard
-            ext: tar.gz
+            suffix: ""
           - label: windows
             os: windows-latest
             bin: watts-dashboard.exe
-            ext: zip
+            suffix: ".exe"
 
     steps:
       - uses: actions/checkout@v4

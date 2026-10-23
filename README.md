@@ -15,18 +15,19 @@ Pick a time range at the top of the page:
 | Year       | total kWh produced per month, last 12 months    |
 | Lifetime   | total kWh produced per month, all time          |
 
-Power readings (`Watts`) are converted to energy with
-`kWh = Watts / 1000 * (INTERVAL_MINUTES / 60)`.
+Energy is read from the `wattsperhour` column (watt-hours) and displayed in
+kWh via a simple `kWh = wattsperhour / 1000`. Aggregated views sum the
+`wattsperhour` values in each bucket, then divide by 1000.
 
 The table is expected to have these columns:
 
-| column        | meaning                          |
-|---------------|----------------------------------|
-| `id`          | row id                           |
-| `Watts`       | instantaneous power              |
-| `wattsperhour`| energy per hour                  |
-| `invertertime`| timestamp from the inverter      |
-| `created_at`  | row insertion time               |
+| column        | meaning                                   |
+|---------------|-------------------------------------------|
+| `id`          | row id                                    |
+| `Watts`       | instantaneous power (not currently charted) |
+| `wattsperhour`| energy in watt-hours — the source for kWh |
+| `invertertime`| timestamp from the inverter               |
+| `created_at`  | row insertion time                        |
 
 ## Configuration
 
@@ -45,7 +46,7 @@ cp .env.example .env
 | `TIME_COLUMN`   | `invertertime`       | column used for the x-axis / ordering              |
 | `BIND_ADDR`     | `127.0.0.1:8080`     | address the web server listens on                  |
 | `DEFAULT_LIMIT` | `1000`               | max rows returned for the Day view (safety cap)    |
-| `INTERVAL_MINUTES` | `15`              | minutes between readings; used for the kWh conversion |
+| `INTERVAL_MINUTES` | `15`              | only affects mock-data point spacing (not the DB conversion) |
 | `RUST_LOG`      | `info`               | log verbosity                                      |
 
 > **Note:** `TABLE_NAME` and `TIME_COLUMN` are validated to be plain SQL

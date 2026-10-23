@@ -333,11 +333,12 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
 // Database-backed queries.
 // ---------------------------------------------------------------------------
 
-/// Builds the SQL for a range. `factor` converts a watt(-sum) into kWh:
-/// energy = Watts / 1000 * (interval_minutes / 60). Table/time-column names are
-/// validated identifiers (not bindable), so interpolation is safe here.
+/// Builds the SQL for a range. Energy comes from the `wattsperhour` column
+/// (watt-hours), converted to kWh by the bound `factor` (= 1/1000). Table and
+/// time-column names are validated identifiers (not bindable), so interpolation
+/// is safe here.
 fn build_sql(range: Range, table: &str, time_col: &str) -> String {
-    let watts = "CAST(Watts AS DOUBLE)";
+    let watts = "CAST(wattsperhour AS DOUBLE)";
     match range {
         Range::Day => format!(
             "SELECT DATE_FORMAT(`{time_col}`, '%H:%i') AS label, \
@@ -383,7 +384,8 @@ async fn data(
     let cfg = &state.config;
     let range = params.range.as_deref().map(Range::parse).unwrap_or(Range::Day);
     let limit = cfg.default_limit.clamp(1, 100_000);
-    let factor = cfg.interval_minutes / 60.0 / 1000.0;
+    // wattsperhour is in watt-hours; divide by 1000 to get kWh.
+    let factor = 1.0 / 1000.0;
 
     let points = if cfg.mock_data {
         generate_mock(range, cfg.interval_minutes, limit)
