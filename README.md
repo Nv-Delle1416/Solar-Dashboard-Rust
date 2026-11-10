@@ -15,9 +15,9 @@ Pick a time range at the top of the page:
 | Year       | total kWh produced per month, last 12 months    |
 | Lifetime   | total kWh produced per month, all time          |
 
-Energy is read from the `wattsperhour` column (watt-hours) and displayed in
-kWh via a simple `kWh = wattsperhour / 1000`. Aggregated views sum the
-`wattsperhour` values in each bucket, then divide by 1000.
+Energy is read from the `ENERGY_COLUMN` (default: `wattsperhour`) in watt-hours and
+displayed in kWh via a simple `kWh = watt-hours / 1000`. Aggregated views sum the
+energy values in each bucket, then divide by 1000.
 
 The table is expected to have these columns:
 
@@ -25,7 +25,7 @@ The table is expected to have these columns:
 |---------------|-------------------------------------------|
 | `id`          | row id                                    |
 | `Watts`       | instantaneous power (not currently charted) |
-| `wattsperhour`| energy in watt-hours — the source for kWh |
+| `{ENERGY_COLUMN}` | energy in watt-hours — the source for kWh (default: `wattsperhour`) |
 | `invertertime`| timestamp from the inverter               |
 | `created_at`  | row insertion time                        |
 
@@ -44,12 +44,13 @@ cp .env.example .env
 | `DATABASE_URL`  | *(required)*         | MySQL endpoint: `mysql://user:pass@host:3306/db` (not needed in mock mode) |
 | `TABLE_NAME`    | `readings`           | table to query                                     |
 | `TIME_COLUMN`   | `invertertime`       | column used for the x-axis / ordering              |
+| `ENERGY_COLUMN` | `wattsperhour`       | column containing energy in watt-hours             |
 | `BIND_ADDR`     | `127.0.0.1:8080`     | address the web server listens on                  |
 | `DEFAULT_LIMIT` | `1000`               | max rows returned for the Day view (safety cap)    |
 | `INTERVAL_MINUTES` | `15`              | only affects mock-data point spacing (not the DB conversion) |
 | `RUST_LOG`      | `info`               | log verbosity                                      |
 
-> **Note:** `TABLE_NAME` and `TIME_COLUMN` are validated to be plain SQL
+> **Note:** `TABLE_NAME`, `TIME_COLUMN`, and `ENERGY_COLUMN` are validated to be plain SQL
 > identifiers (letters, digits, underscore) to prevent injection, since
 > identifiers cannot be passed as bound query parameters.
 
@@ -151,6 +152,12 @@ mysql -u <user> -p <database> < seed.sql
 (Requires MySQL 8.0+ or MariaDB 10.2+. Edit `seed.sql` to change the date range
 or interval.)
 
+**Note on re-seeding**: If you run the seed script multiple times, you may need
+to drop the index first to avoid duplicate index errors:
+```sh
+mysql -u <user> -p <database> -e "DROP INDEX idx_invertertime ON readings;"
+```
+
 ## Running
 
 ```sh
@@ -164,7 +171,7 @@ Then open the URL printed in the logs (default <http://127.0.0.1:8080>).
 - `GET /` – the dashboard UI
 - `GET /api/data?range=day|week|month|year|lifetime` – returns
   `{ "chart": "line|bar", "unit": "kWh", "points": [{ "label", "kwh" }] }`
-- `GET /api/config` – reports the active table, time column, and mock flag
+- `GET /api/config` – reports the active table, time column, energy column, and mock flag
 
 ## Build a release binary
 

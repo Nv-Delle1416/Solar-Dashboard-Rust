@@ -95,7 +95,7 @@
         const c = await (await fetch('/api/config')).json();
         document.getElementById('source').textContent = c.mock_data
           ? `Mock data (no database) · time axis: ${c.time_column}`
-          : `Table: ${c.table_name} · time axis: ${c.time_column}`;
+          : `Table: ${c.table_name} · time axis: ${c.time_column} · energy column: ${c.energy_column}`;
       } catch (e) {
         document.getElementById('source').textContent = 'Could not load config';
       }
