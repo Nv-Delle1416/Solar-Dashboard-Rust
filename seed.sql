@@ -4,6 +4,9 @@
 -- fills it with a realistic solar-production curve: zero overnight, ramping up
 -- after sunrise, peaking around midday, and tapering off before sunset.
 --
+-- The energy column uses the default name `wattsperhour` but can be
+-- configured via the ENERGY_COLUMN environment variable.
+--
 -- Covers the last 3 days at 15-minute intervals (~288 rows).
 --
 -- Run it with either:
@@ -19,6 +22,9 @@ CREATE TABLE IF NOT EXISTS readings (
     invertertime  DATETIME     NOT NULL,
     created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Index on the time column for faster range queries
+CREATE INDEX IF NOT EXISTS idx_invertertime ON readings(invertertime);
 
 -- Re-seeding? Uncomment the next line to clear existing rows first.
 -- TRUNCATE TABLE readings;
@@ -63,8 +69,8 @@ watts AS (
 )
 SELECT
     watts,
-    -- Cumulative energy (Wh) generated so far each day: watts * 0.25h per slot.
-    ROUND(SUM(watts * 0.25) OVER (PARTITION BY DATE(ts) ORDER BY ts), 1) AS wattsperhour,
+    -- Energy (Wh) per 15-minute interval: watts * 0.25h per slot.
+    ROUND(watts * 0.25, 1) AS wattsperhour,
     ts AS invertertime,
     ts AS created_at
 FROM watts

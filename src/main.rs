@@ -20,6 +20,7 @@ struct Config {
     database_url: String,
     table_name: String,
     time_column: String,
+    energy_column: String,
     bind_addr: SocketAddr,
     default_limit: i64,
     interval_minutes: f64,
@@ -47,6 +48,10 @@ impl Config {
             std::env::var("TIME_COLUMN").unwrap_or_else(|_| "invertertime".to_string());
         validate_identifier(&time_column).context("invalid TIME_COLUMN")?;
 
+        let energy_column =
+            std::env::var("ENERGY_COLUMN").unwrap_or_else(|_| "wattsperhour".to_string());
+        validate_identifier(&energy_column).context("invalid ENERGY_COLUMN")?;
+
         let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
             .parse()
@@ -69,6 +74,7 @@ impl Config {
             database_url,
             table_name,
             time_column,
+            energy_column,
             bind_addr,
             default_limit,
             interval_minutes,
@@ -196,6 +202,7 @@ async fn index() -> Html<&'static str> {
 struct ConfigInfo {
     table_name: String,
     time_column: String,
+    energy_column: String,
     mock_data: bool,
 }
 
@@ -203,6 +210,7 @@ async fn config_info(State(state): State<Arc<AppState>>) -> Json<ConfigInfo> {
     Json(ConfigInfo {
         table_name: state.config.table_name.clone(),
         time_column: state.config.time_column.clone(),
+        energy_column: state.config.energy_column.clone(),
         mock_data: state.config.mock_data,
     })
 }
@@ -333,12 +341,12 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
 // Database-backed queries.
 // ---------------------------------------------------------------------------
 
-/// Builds the SQL for a range. Energy comes from the `wattsperhour` column
+/// Builds the SQL for a range. Energy comes from the `energy_column` column
 /// (watt-hours), converted to kWh by the bound `factor` (= 1/1000). Table and
-/// time-column names are validated identifiers (not bindable), so interpolation
+/// column names are validated identifiers (not bindable), so interpolation
 /// is safe here.
-fn build_sql(range: Range, table: &str, time_col: &str) -> String {
-    let watts = "CAST(wattsperhour AS DOUBLE)";
+fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> String {
+    let watts = format!("CAST({energy_col} AS DOUBLE)");
     match range {
         Range::Day => format!(
             "SELECT DATE_FORMAT(`{time_col}`, '%H:%i') AS label, \
@@ -384,7 +392,7 @@ async fn data(
     let cfg = &state.config;
     let range = params.range.as_deref().map(Range::parse).unwrap_or(Range::Day);
     let limit = cfg.default_limit.clamp(1, 100_000);
-    // wattsperhour is in watt-hours; divide by 1000 to get kWh.
+    // ENERGY_COLUMN contains watt-hours; divide by 1000 to get kWh.
     let factor = 1.0 / 1000.0;
 
     let points = if cfg.mock_data {
@@ -395,7 +403,7 @@ async fn data(
             .as_ref()
             .ok_or_else(|| ApiError(anyhow!("database not configured")))?;
 
-        let sql = build_sql(range, &cfg.table_name, &cfg.time_column);
+        let sql = build_sql(range, &cfg.table_name, &cfg.time_column, &cfg.energy_column);
         let mut query = sqlx::query_as::<_, ChartPoint>(&sql).bind(factor);
         if range == Range::Day {
             query = query.bind(limit);
@@ -499,24 +507,25 @@ mod tests {
     // ---- build_sql ----------------------------------------------------------
 
     #[test]
-    fn sql_reads_wattsperhour_not_watts() {
+    fn sql_reads_energy_column_not_watts() {
         for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
-            let sql = build_sql(r, "readings", "invertertime");
-            assert!(sql.contains("wattsperhour"), "{r:?} should use wattsperhour");
+            let sql = build_sql(r, "readings", "invertertime", "wattsperhour");
+            assert!(sql.contains("wattsperhour"), "{r:?} should use energy column");
             assert!(!sql.contains("CAST(Watts"), "{r:?} must not use the Watts column");
         }
     }
 
     #[test]
     fn sql_interpolates_table_and_time_column() {
-        let sql = build_sql(Range::Week, "my_table", "ts_col");
+        let sql = build_sql(Range::Week, "my_table", "ts_col", "energy_col");
         assert!(sql.contains("`my_table`"));
         assert!(sql.contains("`ts_col`"));
+        assert!(sql.contains("energy_col"));
     }
 
     #[test]
     fn sql_day_is_raw_with_limit() {
-        let sql = build_sql(Range::Day, "readings", "invertertime");
+        let sql = build_sql(Range::Day, "readings", "invertertime", "wattsperhour");
         assert!(sql.contains("INTERVAL 1 DAY"));
         assert!(sql.contains("LIMIT ?"));
         assert!(!sql.contains("GROUP BY"), "day view should not aggregate");
@@ -524,25 +533,25 @@ mod tests {
 
     #[test]
     fn sql_week_and_month_group_by_day_with_window() {
-        let week = build_sql(Range::Week, "readings", "invertertime");
+        let week = build_sql(Range::Week, "readings", "invertertime", "wattsperhour");
         assert!(week.contains("INTERVAL 7 DAY"));
         assert!(week.contains("GROUP BY DATE(`invertertime`)"));
         assert!(week.contains("SUM("));
 
-        let month = build_sql(Range::Month, "readings", "invertertime");
+        let month = build_sql(Range::Month, "readings", "invertertime", "wattsperhour");
         assert!(month.contains("INTERVAL 30 DAY"));
     }
 
     #[test]
     fn sql_year_windows_one_year_and_groups_by_month() {
-        let sql = build_sql(Range::Year, "readings", "invertertime");
+        let sql = build_sql(Range::Year, "readings", "invertertime", "wattsperhour");
         assert!(sql.contains("INTERVAL 1 YEAR"));
         assert!(sql.contains("MONTH(`invertertime`)"));
     }
 
     #[test]
     fn sql_lifetime_has_no_time_filter() {
-        let sql = build_sql(Range::Lifetime, "readings", "invertertime");
+        let sql = build_sql(Range::Lifetime, "readings", "invertertime", "wattsperhour");
         assert!(!sql.contains("WHERE"), "lifetime should scan all rows");
         assert!(sql.contains("GROUP BY YEAR"));
     }

@@ -25,7 +25,7 @@ The table is expected to have these columns:
 |---------------|-------------------------------------------|
 | `id`          | row id                                    |
 | `Watts`       | instantaneous power (not currently charted) |
-| `wattsperhour`| energy in watt-hours — the source for kWh |
+| `{ENERGY_COLUMN}` | energy in watt-hours — the source for kWh (default: `wattsperhour`) |
 | `invertertime`| timestamp from the inverter               |
 | `created_at`  | row insertion time                        |
 
@@ -44,12 +44,13 @@ cp .env.example .env
 | `DATABASE_URL`  | *(required)*         | MySQL endpoint: `mysql://user:pass@host:3306/db` (not needed in mock mode) |
 | `TABLE_NAME`    | `readings`           | table to query                                     |
 | `TIME_COLUMN`   | `invertertime`       | column used for the x-axis / ordering              |
+| `ENERGY_COLUMN` | `wattsperhour`       | column containing energy in watt-hours             |
 | `BIND_ADDR`     | `127.0.0.1:8080`     | address the web server listens on                  |
 | `DEFAULT_LIMIT` | `1000`               | max rows returned for the Day view (safety cap)    |
 | `INTERVAL_MINUTES` | `15`              | only affects mock-data point spacing (not the DB conversion) |
 | `RUST_LOG`      | `info`               | log verbosity                                      |
 
-> **Note:** `TABLE_NAME` and `TIME_COLUMN` are validated to be plain SQL
+> **Note:** `TABLE_NAME`, `TIME_COLUMN`, and `ENERGY_COLUMN` are validated to be plain SQL
 > identifiers (letters, digits, underscore) to prevent injection, since
 > identifiers cannot be passed as bound query parameters.
 
