@@ -346,7 +346,7 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
 /// column names are validated identifiers (not bindable), so interpolation
 /// is safe here.
 fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> String {
-    let watts = format!("CAST({energy_col} AS DOUBLE)");
+    let watts = format!("CAST(`{energy_col}` AS DOUBLE)");
     match range {
         Range::Day => format!(
             "SELECT DATE_FORMAT(`{time_col}`, '%H:%i') AS label, \

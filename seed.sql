@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS readings (
 );
 
 -- Index on the time column for faster range queries
-CREATE INDEX IF NOT EXISTS idx_invertertime ON readings(invertertime);
+-- Note: MySQL 8.0 does not support CREATE INDEX IF NOT EXISTS.
+-- Drop the index first if re-seeding: DROP INDEX idx_invertertime ON readings;
+CREATE INDEX idx_invertertime ON readings(invertertime);
 
 -- Re-seeding? Uncomment the next line to clear existing rows first.
 -- TRUNCATE TABLE readings;
