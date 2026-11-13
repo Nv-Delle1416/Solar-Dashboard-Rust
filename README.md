@@ -10,14 +10,15 @@ Pick a time range at the top of the page:
 | range      | what it shows                                   |
 |------------|-------------------------------------------------|
 | Day        | every reading over the last 24h (kWh per interval) |
-| Week       | total kWh produced per day, last 7 days         |
-| Month      | total kWh produced per day, last 30 days        |
-| Year       | total kWh produced per month, last 12 months    |
-| Lifetime   | total kWh produced per month, all time          |
+| Week       | average kWh per day, last 7 days                |
+| Month      | average kWh per day, last 30 days               |
+| Year       | average kWh per month, last 12 months           |
+| Lifetime   | average kWh per month, all time                 |
 
 Energy is read from the `ENERGY_COLUMN` (default: `wattsperhour`) in watt-hours and
-displayed in kWh via a simple `kWh = watt-hours / 1000`. Aggregated views sum the
-energy values in each bucket, then divide by 1000.
+displayed in kWh via a simple `kWh = watt-hours / 1000`. Aggregated views take the
+**average** reading in each bucket (`AVG(...)`), then divide by 1000. The Day view
+plots each raw reading.
 
 The table is expected to have these columns:
 

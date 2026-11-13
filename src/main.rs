@@ -114,10 +114,10 @@ struct ChartPoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Range {
     Day,      // all intervals over the last 24h
-    Week,     // total kWh per day, last 7 days
-    Month,    // total kWh per day, last ~30 days
-    Year,     // total kWh per month, last 12 months
-    Lifetime, // total kWh per month, all data
+    Week,     // average kWh per day, last 7 days
+    Month,    // average kWh per day, last ~30 days
+    Year,     // average kWh per month, last 12 months
+    Lifetime, // average kWh per month, all data
 }
 
 impl Range {
@@ -276,6 +276,30 @@ fn mock_month_kwh(year: i32, month: u32, interval_minutes: f64) -> f64 {
     sum
 }
 
+/// Number of readings in a day at the given sampling interval.
+fn readings_per_day(interval_minutes: f64) -> f64 {
+    (24.0 * 60.0) / interval_minutes
+}
+
+/// Number of days in a given month.
+fn days_in_month(year: i32, month: u32) -> i64 {
+    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    let next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
+    (next - first).num_days()
+}
+
+/// Average kWh per reading over a calendar day (matches SQL AVG over all rows).
+fn mock_day_avg_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
+    mock_day_kwh(date, interval_minutes) / readings_per_day(interval_minutes)
+}
+
+/// Average kWh per reading over a month (matches SQL AVG over all rows).
+fn mock_month_avg_kwh(year: i32, month: u32, interval_minutes: f64) -> f64 {
+    let count = days_in_month(year, month) as f64 * readings_per_day(interval_minutes);
+    mock_month_kwh(year, month, interval_minutes) / count
+}
+
 /// Builds the chart points for a given range entirely from the mock model.
 fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPoint> {
     let now = Local::now().naive_local();
@@ -302,7 +326,7 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
                     let d = today - Duration::days(back);
                     ChartPoint {
                         label: d.format("%Y-%m-%d").to_string(),
-                        kwh: round2(mock_day_kwh(d, interval_minutes)),
+                        kwh: round2(mock_day_avg_kwh(d, interval_minutes)),
                     }
                 })
                 .collect()
@@ -323,7 +347,7 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
             for _ in 0..months {
                 out.push(ChartPoint {
                     label: format!("{y:04}-{m:02}"),
-                    kwh: round2(mock_month_kwh(y, m, interval_minutes)),
+                    kwh: round2(mock_month_avg_kwh(y, m, interval_minutes)),
                 });
                 if m == 12 {
                     m = 1;
@@ -342,7 +366,9 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
 // ---------------------------------------------------------------------------
 
 /// Builds the SQL for a range. Energy comes from the `energy_column` column
-/// (watt-hours), converted to kWh by the bound `factor` (= 1/1000). Table and
+/// (watt-hours), converted to kWh by the bound `factor` (= 1/1000). Aggregated
+/// views report the AVERAGE reading per bucket (per day for Week/Month, per
+/// month for Year/Lifetime); the Day view returns each raw reading. Table and
 /// column names are validated identifiers (not bindable), so interpolation
 /// is safe here.
 fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> String {
@@ -360,7 +386,7 @@ fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> Str
             let interval = if range == Range::Week { "7 DAY" } else { "30 DAY" };
             format!(
                 "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m-%d') AS label, \
-                    COALESCE(SUM({watts}), 0) * ? AS kwh \
+                    COALESCE(AVG({watts}), 0) * ? AS kwh \
                  FROM `{table}` \
                  WHERE `{time_col}` >= (NOW() - INTERVAL {interval}) \
                  GROUP BY DATE(`{time_col}`) \
@@ -369,7 +395,7 @@ fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> Str
         }
         Range::Year => format!(
             "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m') AS label, \
-                COALESCE(SUM({watts}), 0) * ? AS kwh \
+                COALESCE(AVG({watts}), 0) * ? AS kwh \
              FROM `{table}` \
              WHERE `{time_col}` >= (NOW() - INTERVAL 1 YEAR) \
              GROUP BY YEAR(`{time_col}`), MONTH(`{time_col}`) \
@@ -377,7 +403,7 @@ fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> Str
         ),
         Range::Lifetime => format!(
             "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m') AS label, \
-                COALESCE(SUM({watts}), 0) * ? AS kwh \
+                COALESCE(AVG({watts}), 0) * ? AS kwh \
              FROM `{table}` \
              GROUP BY YEAR(`{time_col}`), MONTH(`{time_col}`) \
              ORDER BY YEAR(`{time_col}`), MONTH(`{time_col}`) ASC"
@@ -536,7 +562,8 @@ mod tests {
         let week = build_sql(Range::Week, "readings", "invertertime", "wattsperhour");
         assert!(week.contains("INTERVAL 7 DAY"));
         assert!(week.contains("GROUP BY DATE(`invertertime`)"));
-        assert!(week.contains("SUM("));
+        assert!(week.contains("AVG("));
+        assert!(!week.contains("SUM("), "aggregated views should average, not sum");
 
         let month = build_sql(Range::Month, "readings", "invertertime", "wattsperhour");
         assert!(month.contains("INTERVAL 30 DAY"));
@@ -547,6 +574,7 @@ mod tests {
         let sql = build_sql(Range::Year, "readings", "invertertime", "wattsperhour");
         assert!(sql.contains("INTERVAL 1 YEAR"));
         assert!(sql.contains("MONTH(`invertertime`)"));
+        assert!(sql.contains("AVG("));
     }
 
     #[test]
@@ -554,6 +582,7 @@ mod tests {
         let sql = build_sql(Range::Lifetime, "readings", "invertertime", "wattsperhour");
         assert!(!sql.contains("WHERE"), "lifetime should scan all rows");
         assert!(sql.contains("GROUP BY YEAR"));
+        assert!(sql.contains("AVG("));
     }
 
     // ---- mock model ---------------------------------------------------------
