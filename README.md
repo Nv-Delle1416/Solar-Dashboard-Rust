@@ -183,7 +183,8 @@ Then open the URL printed in the logs (default <http://127.0.0.1:8080>).
 
 - `GET /` – the dashboard UI
 - `GET /api/data?range=day|week|month|year|lifetime` – returns
-  `{ "chart": "line|bar", "unit": "kWh", "points": [{ "label", "kwh" }] }`
+  `{ "chart": "line|bar", "unit": "kWh"|"kWh/h", "points": [{ "label", "kwh" }] }`
+  (`unit` is `kWh` for the cumulative Day view and `kWh/h` for the averaged views)
 - `GET /api/config` – reports the active table, time column, energy column, and mock flag
 
 ## Build a release binary
