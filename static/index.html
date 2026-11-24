@@ -64,9 +64,9 @@
 
   <div class="card">
     <div class="stats">
-      <div class="stat"><div class="value" id="statTotal">–</div><div class="key">Total kWh</div></div>
-      <div class="stat"><div class="value" id="statPeak">–</div><div class="key">Peak kWh</div></div>
-      <div class="stat"><div class="value" id="statAvg">–</div><div class="key">Average kWh</div></div>
+      <div class="stat"><div class="value" id="statPeak">–</div><div class="key" id="peakKey">Peak</div></div>
+      <div class="stat"><div class="value" id="statAvg">–</div><div class="key" id="avgKey">Average</div></div>
+      <div class="stat"><div class="value" id="statLatest">–</div><div class="key" id="latestKey">Latest</div></div>
       <div class="stat"><div class="value" id="statCount">–</div><div class="key" id="countKey">Points</div></div>
     </div>
   </div>
@@ -80,11 +80,11 @@
     let currentRange = 'day';
 
     const RANGE_LABEL = {
-      day: 'kWh per interval (last 24h)',
-      week: 'Average kWh per day (last 7 days)',
-      month: 'Average kWh per day (last 30 days)',
-      year: 'Average kWh per month (last 12 months)',
-      lifetime: 'Average kWh per month (all time)',
+      day: 'Cumulative kWh (latest day)',
+      week: 'Avg kWh/h per day (last 7 days)',
+      month: 'Avg kWh/h per day (last 30 days)',
+      year: 'Avg kWh/h per month (last 12 months)',
+      lifetime: 'Avg kWh/h per month (all time)',
     };
     const COUNT_LABEL = {
       day: 'Intervals', week: 'Days', month: 'Days', year: 'Months', lifetime: 'Months',
@@ -132,14 +132,17 @@
       const unit = payload.unit || 'kWh';
 
       const valid = values.filter(v => typeof v === 'number' && !Number.isNaN(v));
-      const total = valid.reduce((a, b) => a + b, 0);
       const peak = valid.length ? Math.max(...valid) : null;
-      const avg = valid.length ? total / valid.length : null;
+      const avg = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : null;
+      const latest = valid.length ? valid[valid.length - 1] : null;
 
-      document.getElementById('statTotal').textContent = fmt(total);
       document.getElementById('statPeak').textContent = fmt(peak);
       document.getElementById('statAvg').textContent = fmt(avg);
+      document.getElementById('statLatest').textContent = fmt(latest);
       document.getElementById('statCount').textContent = fmt(points.length);
+      document.getElementById('peakKey').textContent = `Peak (${unit})`;
+      document.getElementById('avgKey').textContent = `Average (${unit})`;
+      document.getElementById('latestKey').textContent = `Latest (${unit})`;
       document.getElementById('countKey').textContent = COUNT_LABEL[currentRange];
 
       const isLine = payload.chart === 'line';
