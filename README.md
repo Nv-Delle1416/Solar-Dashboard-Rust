@@ -9,26 +9,36 @@ Pick a time range at the top of the page:
 
 | range      | what it shows                                   |
 |------------|-------------------------------------------------|
-| Day        | every reading over the last 24h (kWh per interval) |
-| Week       | average kWh per day, last 7 days                |
-| Month      | average kWh per day, last 30 days               |
-| Year       | average kWh per month, last 12 months           |
-| Lifetime   | average kWh per month, all time                 |
+| Day        | cumulative kWh rising through the latest day     |
+| Week       | average kWh per hour, per day, last 7 days      |
+| Month      | average kWh per hour, per day, last 30 days     |
+| Year       | average kWh per hour, per month, last 12 months |
+| Lifetime   | average kWh per hour, per month, all time       |
 
-Energy is read from the `ENERGY_COLUMN` (default: `wattsperhour`) in watt-hours and
-displayed in kWh via a simple `kWh = watt-hours / 1000`. Aggregated views take the
-**average** reading in each bucket (`AVG(...)`), then divide by 1000. The Day view
-plots each raw reading.
+**How energy is computed.** `ENERGY_COLUMN` (default `wattsperhour`) is a
+**cumulative daily watt-hour counter** — it starts at ~0 each day and climbs to
+the day's total, then resets. So:
+
+- **Daily energy (kWh)** = `MAX(wattsperhour) / 1000` for that day (the end-of-day
+  peak), *not* a sum or average of readings.
+- **Average kWh/h** for a day = daily energy ÷ hours; for a month = total monthly
+  energy ÷ month hours. The hours denominator is set by `AVERAGE_BASIS`:
+  `day` (fixed 24h, whole-day average) or `daylight` (first-to-last reading span).
+- The **Day** view plots the cumulative counter (`wattsperhour / 1000`) rising to
+  the day's total.
+
+Time windows are relative to the **newest reading in the table**, not the wall
+clock, so a static/historical export still renders.
 
 The table is expected to have these columns:
 
 | column        | meaning                                   |
 |---------------|-------------------------------------------|
 | `id`          | row id                                    |
-| `Watts`       | instantaneous power (not currently charted) |
-| `{ENERGY_COLUMN}` | energy in watt-hours — the source for kWh (default: `wattsperhour`) |
-| `invertertime`| timestamp from the inverter               |
-| `created_at`  | row insertion time                        |
+| `watts`       | instantaneous power (not currently charted) |
+| `{ENERGY_COLUMN}` | cumulative daily watt-hours — the source for kWh (default: `wattsperhour`) |
+| `invertertime`| inverter timestamp (ISO-8601 string with TZ offset) |
+| `created_at`  | row insertion datetime                    |
 
 ## Configuration
 
@@ -43,9 +53,11 @@ cp .env.example .env
 |-----------------|----------------------|----------------------------------------------------|
 | `MOCK_DATA`     | `false`              | serve generated data with no DB (ignores `DATABASE_URL`) |
 | `DATABASE_URL`  | *(required)*         | MySQL endpoint: `mysql://user:pass@host:3306/db` (not needed in mock mode) |
-| `TABLE_NAME`    | `readings`           | table to query                                     |
-| `TIME_COLUMN`   | `invertertime`       | column used for the x-axis / ordering              |
-| `ENERGY_COLUMN` | `wattsperhour`       | column containing energy in watt-hours             |
+| `TABLE_NAME`    | `solarpower`         | table to query                                     |
+| `TIME_COLUMN`   | `invertertime`       | column used for the x-axis / grouping              |
+| `ENERGY_COLUMN` | `wattsperhour`       | cumulative daily watt-hour counter                 |
+| `PARSE_ISO_TIME`| `true`               | parse `TIME_COLUMN` as an ISO-8601 string (set `false` for a native DATETIME) |
+| `AVERAGE_BASIS` | `day`                | hours denominator for the average: `day` (24h) or `daylight` (reading span) |
 | `BIND_ADDR`     | `127.0.0.1:8080`     | address the web server listens on                  |
 | `DEFAULT_LIMIT` | `1000`               | max rows returned for the Day view (safety cap)    |
 | `INTERVAL_MINUTES` | `15`              | only affects mock-data point spacing (not the DB conversion) |
@@ -142,22 +154,22 @@ isn't backed by real rows.
 
 ### Mock data in a real database
 
-If you'd rather load sample rows into an actual MySQL database, use the seed
-script. It creates the `readings` table and inserts a solar curve for the last
-3 days at 15-minute intervals:
+If you'd rather load sample rows into an actual MySQL/MariaDB database, use the
+seed script. It creates the `solarpower` table (the default `TABLE_NAME`) with
+the same shape as the real inverter export — a **cumulative daily**
+`wattsperhour` counter and an ISO-8601 `invertertime` string — and fills it with
+a solar curve for the last 3 days at 10-minute intervals:
 
 ```sh
 mysql -u <user> -p <database> < seed.sql
 ```
 
-(Requires MySQL 8.0+ or MariaDB 10.2+. Edit `seed.sql` to change the date range
-or interval.)
+With the default `.env` (`TABLE_NAME=solarpower`, `PARSE_ISO_TIME=true`) the app
+works against this seed with no extra configuration.
 
-**Note on re-seeding**: If you run the seed script multiple times, you may need
-to drop the index first to avoid duplicate index errors:
-```sh
-mysql -u <user> -p <database> -e "DROP INDEX idx_invertertime ON readings;"
-```
+(Requires MySQL 8.0+ or MariaDB 10.2+. Edit `seed.sql` to change the date range
+or interval. Re-seeding appends rows; `TRUNCATE TABLE solarpower;` first for a
+clean slate.)
 
 ## Running
 

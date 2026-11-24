@@ -1,79 +1,70 @@
--- Mock data for the Watts Dashboard.
+-- Sample data for the Solar Energy Dashboard.
 --
--- Creates the `readings` table (matching the app's default TABLE_NAME) and
--- fills it with a realistic solar-production curve: zero overnight, ramping up
--- after sunrise, peaking around midday, and tapering off before sunset.
+-- Creates the `solarpower` table (the app's default TABLE_NAME) matching the
+-- real inverter export schema, and fills it with a realistic solar curve for
+-- the last 3 days at 10-minute intervals.
 --
--- The energy column uses the default name `wattsperhour` but can be
--- configured via the ENERGY_COLUMN environment variable.
+-- Key points so this matches what the app expects:
+--   * `wattsperhour` is a CUMULATIVE daily watt-hour counter: it resets to 0
+--     each day and climbs to that day's total (daily kWh = MAX/1000).
+--   * `invertertime` is an ISO-8601 string with a TZ offset (parsed by the app
+--     when PARSE_ISO_TIME=true, the default).
+--   * `watts` is instantaneous power.
 --
--- Covers the last 3 days at 15-minute intervals (~288 rows).
---
--- Run it with either:
+-- Run it with:
 --   mysql -u <user> -p <database> < seed.sql
---   -- or paste into any MySQL client connected to your database.
 --
 -- Requires MySQL 8.0+ or MariaDB 10.2+ (recursive CTEs + window functions).
 
-CREATE TABLE IF NOT EXISTS readings (
-    id            INT AUTO_INCREMENT PRIMARY KEY,
-    Watts         DOUBLE       NOT NULL,
-    wattsperhour  DOUBLE       NOT NULL,
-    invertertime  DATETIME     NOT NULL,
-    created_at    TIMESTAMP    NOT NULL DEFAULT CURRENT_TIMESTAMP
+CREATE TABLE IF NOT EXISTS solarpower (
+    watts         INT             NOT NULL,
+    wattsperhour  INT UNSIGNED    NOT NULL,
+    invertertime  VARCHAR(45)     NOT NULL,
+    created_at    DATETIME        DEFAULT CURRENT_TIMESTAMP,
+    id            INT UNSIGNED    NOT NULL AUTO_INCREMENT,
+    PRIMARY KEY (id)
 );
 
--- Index on the time column for faster range queries
--- Note: MySQL 8.0 does not support CREATE INDEX IF NOT EXISTS.
--- Drop the index first if re-seeding: DROP INDEX idx_invertertime ON readings;
-CREATE INDEX idx_invertertime ON readings(invertertime);
+-- Re-seeding? Uncomment to clear existing rows first.
+-- TRUNCATE TABLE solarpower;
 
--- Re-seeding? Uncomment the next line to clear existing rows first.
--- TRUNCATE TABLE readings;
-
-INSERT INTO readings (Watts, wattsperhour, invertertime, created_at)
+INSERT INTO solarpower (watts, wattsperhour, invertertime, created_at)
 WITH RECURSIVE
--- 3 days * 24 hours * 4 (15-min slots) = 288 steps
+-- 3 days * 24 hours * 6 (10-min slots) = 432 steps
 seq AS (
     SELECT 0 AS n
     UNION ALL
-    SELECT n + 1 FROM seq WHERE n + 1 < (3 * 24 * 4)
+    SELECT n + 1 FROM seq WHERE n + 1 < (3 * 24 * 6)
 ),
 points AS (
     SELECT
-        DATE_ADD(
-            DATE_SUB(CURDATE(), INTERVAL 2 DAY),
-            INTERVAL n * 15 MINUTE
-        ) AS ts
+        DATE_ADD(DATE_SUB(CURDATE(), INTERVAL 2 DAY), INTERVAL n * 10 MINUTE) AS ts
     FROM seq
 ),
 calc AS (
-    SELECT
-        ts,
-        HOUR(ts) + MINUTE(ts) / 60.0 AS hod   -- hour-of-day as a decimal
-    FROM points
+    SELECT ts, HOUR(ts) + MINUTE(ts) / 60.0 AS hod FROM points
 ),
-watts AS (
+w AS (
     SELECT
         ts,
-        -- Daylight window ~06:00 to ~20:00; sine bell curve peaking midday,
-        -- with a little random "cloud" variation. Peak ~5.2 kW.
+        -- Daylight ~06:00-20:00; sine bell peaking midday, ~4.5 kW peak.
         CASE
             WHEN hod >= 6 AND hod <= 20 THEN
                 GREATEST(0, ROUND(
-                    5200
-                    * POW(SIN(PI() * (hod - 6) / 14), 1.6)
-                    * (0.88 + 0.12 * RAND()),
-                1))
+                    4500 * POW(SIN(PI() * (hod - 6) / 14), 1.4) * (0.9 + 0.1 * RAND()),
+                0))
             ELSE 0
         END AS watts
     FROM calc
 )
 SELECT
-    watts,
-    -- Energy (Wh) per 15-minute interval: watts * 0.25h per slot.
-    ROUND(watts * 0.25, 1) AS wattsperhour,
-    ts AS invertertime,
+    CAST(watts AS SIGNED) AS watts,
+    -- Cumulative Wh within each day: running sum of watts * (10 min / 60).
+    CAST(
+        COALESCE(SUM(watts * 10.0 / 60.0) OVER (PARTITION BY DATE(ts) ORDER BY ts), 0)
+    AS UNSIGNED) AS wattsperhour,
+    -- ISO-8601 with a TZ offset, like the real inverter data.
+    CONCAT(DATE_FORMAT(ts, '%Y-%m-%dT%H:%i:%s'), '-04:00') AS invertertime,
     ts AS created_at
-FROM watts
+FROM w
 ORDER BY ts;

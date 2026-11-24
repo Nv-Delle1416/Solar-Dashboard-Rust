@@ -14,6 +14,24 @@ use serde::{Deserialize, Serialize};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::MySqlPool;
 
+/// How to divide daily energy into an hourly average.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AverageBasis {
+    /// Divide by a fixed 24 hours (whole-day average, includes night).
+    FixedDay,
+    /// Divide by the daylight span (first-to-last reading each day).
+    Daylight,
+}
+
+impl AverageBasis {
+    fn parse(s: &str) -> AverageBasis {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "daylight" => AverageBasis::Daylight,
+            _ => AverageBasis::FixedDay,
+        }
+    }
+}
+
 /// Runtime configuration, loaded from environment variables (see `.env.example`).
 #[derive(Clone)]
 struct Config {
@@ -21,6 +39,8 @@ struct Config {
     table_name: String,
     time_column: String,
     energy_column: String,
+    parse_iso_time: bool,
+    average_basis: AverageBasis,
     bind_addr: SocketAddr,
     default_limit: i64,
     interval_minutes: f64,
@@ -41,7 +61,7 @@ impl Config {
                 .context("DATABASE_URL must be set (e.g. mysql://user:pass@host:3306/dbname)")?
         };
 
-        let table_name = std::env::var("TABLE_NAME").unwrap_or_else(|_| "readings".to_string());
+        let table_name = std::env::var("TABLE_NAME").unwrap_or_else(|_| "solarpower".to_string());
         validate_identifier(&table_name).context("invalid TABLE_NAME")?;
 
         let time_column =
@@ -51,6 +71,17 @@ impl Config {
         let energy_column =
             std::env::var("ENERGY_COLUMN").unwrap_or_else(|_| "wattsperhour".to_string());
         validate_identifier(&energy_column).context("invalid ENERGY_COLUMN")?;
+
+        // `invertertime` is an ISO-8601 string with a TZ offset; parse it to a
+        // real datetime for grouping/windowing. Set false if the time column is
+        // already a DATETIME/TIMESTAMP.
+        let parse_iso_time = std::env::var("PARSE_ISO_TIME")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no"))
+            .unwrap_or(true);
+
+        let average_basis = std::env::var("AVERAGE_BASIS")
+            .map(|v| AverageBasis::parse(&v))
+            .unwrap_or(AverageBasis::FixedDay);
 
         let bind_addr: SocketAddr = std::env::var("BIND_ADDR")
             .unwrap_or_else(|_| "127.0.0.1:8080".to_string())
@@ -75,6 +106,8 @@ impl Config {
             table_name,
             time_column,
             energy_column,
+            parse_iso_time,
+            average_basis,
             bind_addr,
             default_limit,
             interval_minutes,
@@ -113,11 +146,11 @@ struct ChartPoint {
 /// The time range selected in the UI, which also determines the aggregation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Range {
-    Day,      // all intervals over the last 24h
-    Week,     // average kWh per day, last 7 days
-    Month,    // average kWh per day, last ~30 days
-    Year,     // average kWh per month, last 12 months
-    Lifetime, // average kWh per month, all data
+    Day,      // cumulative kWh over the latest 24h
+    Week,     // avg kWh/h per day, last 7 days
+    Month,    // avg kWh/h per day, last ~30 days
+    Year,     // avg kWh/h per month, last 12 months
+    Lifetime, // avg kWh/h per month, all data
 }
 
 impl Range {
@@ -248,9 +281,16 @@ fn mock_interval_kwh(ts: NaiveDateTime, interval_minutes: f64) -> f64 {
     mock_watts(ts) / 1000.0 * (interval_minutes / 60.0)
 }
 
+/// A strictly-positive step duration, preserving fractional minutes. Guards the
+/// mock loops against a zero-length step (e.g. `INTERVAL_MINUTES=0.5` would
+/// truncate to 0 minutes and loop forever).
+fn interval_step(interval_minutes: f64) -> Duration {
+    Duration::seconds(((interval_minutes * 60.0).round() as i64).max(1))
+}
+
 /// Total energy (kWh) produced on a given calendar day.
 fn mock_day_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
-    let step = Duration::minutes(interval_minutes as i64);
+    let step = interval_step(interval_minutes);
     let mut t = date.and_hms_opt(0, 0, 0).unwrap();
     let end = date
         .succ_opt()
@@ -265,57 +305,91 @@ fn mock_day_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
     sum
 }
 
-/// Total energy (kWh) produced in a given month.
-fn mock_month_kwh(year: i32, month: u32, interval_minutes: f64) -> f64 {
-    let mut sum = 0.0;
+/// Daylight span (hours where power > 0) for a day in the mock model.
+fn mock_daylight_hours(date: NaiveDate, interval_minutes: f64) -> f64 {
+    let step = interval_step(interval_minutes);
+    let mut t = date.and_hms_opt(0, 0, 0).unwrap();
+    let end = date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+    let (mut first, mut last) = (None, None);
+    while t < end {
+        if mock_watts(t) > 0.0 {
+            first.get_or_insert(t);
+            last = Some(t);
+        }
+        t += step;
+    }
+    match (first, last) {
+        (Some(f), Some(l)) => ((l - f).num_seconds() as f64 / 3600.0).max(0.0167),
+        _ => 0.0167,
+    }
+}
+
+/// Denominator hours for a day under the chosen basis.
+fn mock_day_hours(date: NaiveDate, interval_minutes: f64, basis: AverageBasis) -> f64 {
+    match basis {
+        AverageBasis::FixedDay => 24.0,
+        AverageBasis::Daylight => mock_daylight_hours(date, interval_minutes),
+    }
+}
+
+/// Average kWh per hour for a single day: daily energy / denominator hours.
+fn mock_day_avg_per_hour(date: NaiveDate, interval_minutes: f64, basis: AverageBasis) -> f64 {
+    mock_day_kwh(date, interval_minutes) / mock_day_hours(date, interval_minutes, basis)
+}
+
+/// Average kWh per hour for a month: total month energy / total month hours.
+fn mock_month_avg_per_hour(
+    year: i32,
+    month: u32,
+    interval_minutes: f64,
+    basis: AverageBasis,
+) -> f64 {
+    let (mut kwh, mut hours) = (0.0, 0.0);
     let mut d = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
     while d.month() == month {
-        sum += mock_day_kwh(d, interval_minutes);
+        kwh += mock_day_kwh(d, interval_minutes);
+        hours += mock_day_hours(d, interval_minutes, basis);
         d = d.succ_opt().unwrap();
     }
-    sum
-}
-
-/// Number of readings in a day at the given sampling interval.
-fn readings_per_day(interval_minutes: f64) -> f64 {
-    (24.0 * 60.0) / interval_minutes
-}
-
-/// Number of days in a given month.
-fn days_in_month(year: i32, month: u32) -> i64 {
-    let (ny, nm) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
-    let first = NaiveDate::from_ymd_opt(year, month, 1).unwrap();
-    let next = NaiveDate::from_ymd_opt(ny, nm, 1).unwrap();
-    (next - first).num_days()
-}
-
-/// Average kWh per reading over a calendar day (matches SQL AVG over all rows).
-fn mock_day_avg_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
-    mock_day_kwh(date, interval_minutes) / readings_per_day(interval_minutes)
-}
-
-/// Average kWh per reading over a month (matches SQL AVG over all rows).
-fn mock_month_avg_kwh(year: i32, month: u32, interval_minutes: f64) -> f64 {
-    let count = days_in_month(year, month) as f64 * readings_per_day(interval_minutes);
-    mock_month_kwh(year, month, interval_minutes) / count
+    if hours > 0.0 {
+        kwh / hours
+    } else {
+        0.0
+    }
 }
 
 /// Builds the chart points for a given range entirely from the mock model.
-fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPoint> {
+fn generate_mock(
+    range: Range,
+    interval_minutes: f64,
+    basis: AverageBasis,
+    limit: i64,
+) -> Vec<ChartPoint> {
     let now = Local::now().naive_local();
     match range {
+        // A single calendar day: cumulative kWh from midnight, capped to the
+        // most recent `limit` points (not used as a time range).
         Range::Day => {
-            let n = limit.clamp(1, 5000);
-            let step = Duration::minutes(interval_minutes as i64);
-            (0..n)
-                .map(|i| {
-                    let ts = now - step * ((n - 1 - i) as i32);
-                    ChartPoint {
-                        label: ts.format("%H:%M").to_string(),
-                        kwh: round2(mock_interval_kwh(ts, interval_minutes)),
-                    }
-                })
-                .collect()
+            let step = interval_step(interval_minutes);
+            let start = now.date().and_hms_opt(0, 0, 0).unwrap();
+            let end = now.date().succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let mut out = Vec::new();
+            let mut cum = 0.0;
+            let mut t = start;
+            while t < end {
+                cum += mock_interval_kwh(t, interval_minutes);
+                out.push(ChartPoint {
+                    label: t.format("%m-%d %H:%M").to_string(),
+                    kwh: round2(cum),
+                });
+                t += step;
+            }
+            let cap = limit.clamp(1, 5000) as usize;
+            if out.len() > cap {
+                out.split_off(out.len() - cap)
+            } else {
+                out
+            }
         }
         Range::Week | Range::Month => {
             let days = if range == Range::Week { 7 } else { 30 };
@@ -326,7 +400,7 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
                     let d = today - Duration::days(back);
                     ChartPoint {
                         label: d.format("%Y-%m-%d").to_string(),
-                        kwh: round2(mock_day_avg_kwh(d, interval_minutes)),
+                        kwh: round2(mock_day_avg_per_hour(d, interval_minutes, basis)),
                     }
                 })
                 .collect()
@@ -334,7 +408,6 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
         Range::Year | Range::Lifetime => {
             let months = if range == Range::Year { 12 } else { 18 };
             let (mut y, mut m) = (now.year(), now.month());
-            // Walk back `months - 1` months to find the start.
             for _ in 0..(months - 1) {
                 if m == 1 {
                     m = 12;
@@ -347,7 +420,7 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
             for _ in 0..months {
                 out.push(ChartPoint {
                     label: format!("{y:04}-{m:02}"),
-                    kwh: round2(mock_month_avg_kwh(y, m, interval_minutes)),
+                    kwh: round2(mock_month_avg_per_hour(y, m, interval_minutes, basis)),
                 });
                 if m == 12 {
                     m = 1;
@@ -365,49 +438,103 @@ fn generate_mock(range: Range, interval_minutes: f64, limit: i64) -> Vec<ChartPo
 // Database-backed queries.
 // ---------------------------------------------------------------------------
 
-/// Builds the SQL for a range. Energy comes from the `energy_column` column
-/// (watt-hours), converted to kWh by the bound `factor` (= 1/1000). Aggregated
-/// views report the AVERAGE reading per bucket (per day for Week/Month, per
-/// month for Year/Lifetime); the Day view returns each raw reading. Table and
-/// column names are validated identifiers (not bindable), so interpolation
-/// is safe here.
-fn build_sql(range: Range, table: &str, time_col: &str, energy_col: &str) -> String {
-    let watts = format!("CAST(`{energy_col}` AS DOUBLE)");
+/// SQL expression yielding a real datetime from the configured time column.
+/// `invertertime` is stored as an ISO-8601 string with a TZ offset, so we parse
+/// the wall-clock portion; a native DATETIME column is used as-is.
+fn time_expr(time_col: &str, parse_iso: bool) -> String {
+    if parse_iso {
+        // Use the first 19 chars (YYYY-MM-DDTHH:MM:SS) so the trailing TZ offset
+        // never confuses STR_TO_DATE.
+        format!("STR_TO_DATE(LEFT(`{time_col}`, 19), '%Y-%m-%dT%H:%i:%s')")
+    } else {
+        format!("`{time_col}`")
+    }
+}
+
+/// Per-day hours used as the denominator for the average, by basis.
+fn day_hours_expr(ts: &str, basis: AverageBasis) -> String {
+    match basis {
+        AverageBasis::FixedDay => "24.0".to_string(),
+        // Guard against single-reading days (span 0) with a 1-minute floor.
+        AverageBasis::Daylight => {
+            format!("GREATEST(TIMESTAMPDIFF(SECOND, MIN({ts}), MAX({ts})) / 3600.0, 0.0167)")
+        }
+    }
+}
+
+/// Builds the SQL for a range.
+///
+/// * Day  — cumulative kWh (`energy / 1000`) per reading over the latest 24h.
+/// * Week/Month — AVERAGE kWh per hour per day: `MAX(energy)/1000 / day_hours`,
+///   where `energy` is the daily cumulative counter (resets at 0 each day).
+/// * Year/Lifetime — average kWh per hour per month: total monthly energy
+///   (`SUM` of daily `MAX`) divided by the month's hours.
+///
+/// Windows are relative to the newest reading in the table (not `NOW()`), so a
+/// static/historical dataset still renders. Identifiers are validated, so
+/// interpolation is safe.
+fn build_sql(range: Range, table: &str, ts: &str, energy_col: &str, basis: AverageBasis) -> String {
+    let e = format!("CAST(`{energy_col}` AS DOUBLE)");
+    // Anchor windows to the newest *calendar date/month* in the table, aligned to
+    // day/month boundaries so a range yields exactly N full buckets (no partial
+    // leading day/month, no spurious extra bucket).
+    let latest_date = format!("(SELECT DATE(MAX({ts})) FROM `{table}`)");
+    let latest_month = format!("(SELECT DATE_FORMAT(MAX({ts}), '%Y-%m-01') FROM `{table}`)");
+
     match range {
+        // A single calendar day: the latest day's cumulative counter curve.
         Range::Day => format!(
-            "SELECT DATE_FORMAT(`{time_col}`, '%H:%i') AS label, \
-                COALESCE({watts}, 0) * ? AS kwh \
+            "SELECT DATE_FORMAT({ts}, '%m-%d %H:%i') AS label, \
+                COALESCE({e}, 0) / 1000.0 AS kwh \
              FROM `{table}` \
-             WHERE `{time_col}` >= (NOW() - INTERVAL 1 DAY) \
-             ORDER BY `{time_col}` ASC \
+             WHERE DATE({ts}) = {latest_date} \
+             ORDER BY {ts} ASC \
              LIMIT ?"
         ),
         Range::Week | Range::Month => {
-            let interval = if range == Range::Week { "7 DAY" } else { "30 DAY" };
+            // 7 or 30 whole calendar days ending on the latest date.
+            let back = if range == Range::Week { 6 } else { 29 };
+            let denom = day_hours_expr(ts, basis);
             format!(
-                "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m-%d') AS label, \
-                    COALESCE(AVG({watts}), 0) * ? AS kwh \
+                "SELECT DATE_FORMAT({ts}, '%Y-%m-%d') AS label, \
+                    COALESCE(MAX({e}), 0) / 1000.0 / ({denom}) AS kwh \
                  FROM `{table}` \
-                 WHERE `{time_col}` >= (NOW() - INTERVAL {interval}) \
-                 GROUP BY DATE(`{time_col}`) \
-                 ORDER BY DATE(`{time_col}`) ASC"
+                 WHERE DATE({ts}) >= ({latest_date} - INTERVAL {back} DAY) \
+                 GROUP BY DATE({ts}) \
+                 ORDER BY DATE({ts}) ASC"
             )
         }
-        Range::Year => format!(
-            "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m') AS label, \
-                COALESCE(AVG({watts}), 0) * ? AS kwh \
-             FROM `{table}` \
-             WHERE `{time_col}` >= (NOW() - INTERVAL 1 YEAR) \
-             GROUP BY YEAR(`{time_col}`), MONTH(`{time_col}`) \
-             ORDER BY YEAR(`{time_col}`), MONTH(`{time_col}`) ASC"
-        ),
-        Range::Lifetime => format!(
-            "SELECT DATE_FORMAT(`{time_col}`, '%Y-%m') AS label, \
-                COALESCE(AVG({watts}), 0) * ? AS kwh \
-             FROM `{table}` \
-             GROUP BY YEAR(`{time_col}`), MONTH(`{time_col}`) \
-             ORDER BY YEAR(`{time_col}`), MONTH(`{time_col}`) ASC"
-        ),
+        Range::Year | Range::Lifetime => {
+            // 12 whole calendar months ending on the latest month.
+            let where_clause = if range == Range::Year {
+                format!("WHERE {ts} >= ({latest_month} - INTERVAL 11 MONTH) ")
+            } else {
+                String::new()
+            };
+            // Inner query: one row per day with that day's energy and hours.
+            let (day_hours, month_hours) = match basis {
+                AverageBasis::FixedDay => ("24.0".to_string(), "COUNT(*) * 24.0".to_string()),
+                AverageBasis::Daylight => (
+                    format!(
+                        "GREATEST(TIMESTAMPDIFF(SECOND, MIN({ts}), MAX({ts})) / 3600.0, 0.0167)"
+                    ),
+                    "SUM(day_hours)".to_string(),
+                ),
+            };
+            format!(
+                "SELECT DATE_FORMAT(d, '%Y-%m') AS label, \
+                    SUM(day_energy) / 1000.0 / ({month_hours}) AS kwh \
+                 FROM ( \
+                    SELECT DATE({ts}) AS d, \
+                        MAX({e}) AS day_energy, \
+                        {day_hours} AS day_hours \
+                    FROM `{table}` {where_clause}\
+                    GROUP BY DATE({ts}) \
+                 ) t \
+                 GROUP BY DATE_FORMAT(d, '%Y-%m') \
+                 ORDER BY DATE_FORMAT(d, '%Y-%m') ASC"
+            )
+        }
     }
 }
 
@@ -418,19 +545,18 @@ async fn data(
     let cfg = &state.config;
     let range = params.range.as_deref().map(Range::parse).unwrap_or(Range::Day);
     let limit = cfg.default_limit.clamp(1, 100_000);
-    // ENERGY_COLUMN contains watt-hours; divide by 1000 to get kWh.
-    let factor = 1.0 / 1000.0;
 
     let points = if cfg.mock_data {
-        generate_mock(range, cfg.interval_minutes, limit)
+        generate_mock(range, cfg.interval_minutes, cfg.average_basis, limit)
     } else {
         let pool = state
             .pool
             .as_ref()
             .ok_or_else(|| ApiError(anyhow!("database not configured")))?;
 
-        let sql = build_sql(range, &cfg.table_name, &cfg.time_column, &cfg.energy_column);
-        let mut query = sqlx::query_as::<_, ChartPoint>(&sql).bind(factor);
+        let ts = time_expr(&cfg.time_column, cfg.parse_iso_time);
+        let sql = build_sql(range, &cfg.table_name, &ts, &cfg.energy_column, cfg.average_basis);
+        let mut query = sqlx::query_as::<_, ChartPoint>(&sql);
         if range == Range::Day {
             query = query.bind(limit);
         }
@@ -440,9 +566,12 @@ async fn data(
             .map_err(|e| ApiError(anyhow!(e).context("query failed")))?
     };
 
+    // Day is cumulative energy (kWh); the aggregated views are an hourly average.
+    let unit = if range == Range::Day { "kWh" } else { "kWh/h" };
+
     Ok(Json(DataResponse {
         chart: range.chart_kind(),
-        unit: "kWh",
+        unit,
         points,
     }))
 }
@@ -530,59 +659,107 @@ mod tests {
         assert_eq!(round2(13.0), 13.0);
     }
 
+    // ---- AverageBasis -------------------------------------------------------
+
+    #[test]
+    fn average_basis_parse() {
+        assert_eq!(AverageBasis::parse("daylight"), AverageBasis::Daylight);
+        assert_eq!(AverageBasis::parse("DAY"), AverageBasis::FixedDay);
+        assert_eq!(AverageBasis::parse(""), AverageBasis::FixedDay);
+        assert_eq!(AverageBasis::parse("anything"), AverageBasis::FixedDay);
+    }
+
+    // ---- time_expr ----------------------------------------------------------
+
+    #[test]
+    fn time_expr_parses_iso_or_uses_column() {
+        assert_eq!(
+            time_expr("invertertime", true),
+            "STR_TO_DATE(LEFT(`invertertime`, 19), '%Y-%m-%dT%H:%i:%s')"
+        );
+        assert_eq!(time_expr("created_at", false), "`created_at`");
+    }
+
     // ---- build_sql ----------------------------------------------------------
+
+    fn sql(range: Range, basis: AverageBasis) -> String {
+        let ts = time_expr("invertertime", true);
+        build_sql(range, "solarpower", &ts, "wattsperhour", basis)
+    }
 
     #[test]
     fn sql_reads_energy_column_not_watts() {
         for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
-            let sql = build_sql(r, "readings", "invertertime", "wattsperhour");
-            assert!(sql.contains("wattsperhour"), "{r:?} should use energy column");
-            assert!(!sql.contains("CAST(Watts"), "{r:?} must not use the Watts column");
+            let s = sql(r, AverageBasis::FixedDay);
+            assert!(s.contains("wattsperhour"), "{r:?} should use energy column");
+            assert!(!s.contains("`watts`"), "{r:?} must not use the instantaneous watts column");
         }
     }
 
     #[test]
-    fn sql_interpolates_table_and_time_column() {
-        let sql = build_sql(Range::Week, "my_table", "ts_col", "energy_col");
-        assert!(sql.contains("`my_table`"));
-        assert!(sql.contains("`ts_col`"));
-        assert!(sql.contains("energy_col"));
+    fn sql_interpolates_table_and_energy_and_time() {
+        let s = sql(Range::Week, AverageBasis::FixedDay);
+        assert!(s.contains("`solarpower`"));
+        assert!(s.contains("`wattsperhour`"));
+        assert!(s.contains("`invertertime`"));
+        assert!(s.contains("STR_TO_DATE(LEFT("));
     }
 
     #[test]
-    fn sql_day_is_raw_with_limit() {
-        let sql = build_sql(Range::Day, "readings", "invertertime", "wattsperhour");
-        assert!(sql.contains("INTERVAL 1 DAY"));
-        assert!(sql.contains("LIMIT ?"));
-        assert!(!sql.contains("GROUP BY"), "day view should not aggregate");
+    fn sql_windows_relative_to_latest_reading_not_now() {
+        // All non-lifetime ranges base their window on MAX(ts), not NOW().
+        for r in [Range::Day, Range::Week, Range::Month, Range::Year] {
+            let s = sql(r, AverageBasis::FixedDay);
+            assert!(s.contains("MAX("), "{r:?} should window off the latest reading");
+            assert!(!s.contains("NOW()"), "{r:?} must not use NOW()");
+        }
     }
 
     #[test]
-    fn sql_week_and_month_group_by_day_with_window() {
-        let week = build_sql(Range::Week, "readings", "invertertime", "wattsperhour");
-        assert!(week.contains("INTERVAL 7 DAY"));
-        assert!(week.contains("GROUP BY DATE(`invertertime`)"));
-        assert!(week.contains("AVG("));
-        assert!(!week.contains("SUM("), "aggregated views should average, not sum");
+    fn sql_day_is_cumulative_with_limit() {
+        let s = sql(Range::Day, AverageBasis::FixedDay);
+        assert!(s.contains("WHERE DATE("), "day view is a single calendar day");
+        assert!(s.contains("= (SELECT DATE(MAX("), "pinned to the latest date");
+        assert!(s.contains("LIMIT ?"));
+        assert!(s.contains("/ 1000.0"));
+        assert!(!s.contains("GROUP BY"), "day view is per-reading, not aggregated");
+    }
 
-        let month = build_sql(Range::Month, "readings", "invertertime", "wattsperhour");
-        assert!(month.contains("INTERVAL 30 DAY"));
+    #[test]
+    fn sql_week_and_month_use_daily_max() {
+        let week = sql(Range::Week, AverageBasis::FixedDay);
+        assert!(week.contains("INTERVAL 6 DAY"), "7 whole calendar days");
+        assert!(week.contains("GROUP BY DATE("));
+        assert!(week.contains("MAX("), "daily production is the counter MAX");
+        assert!(!week.contains("AVG("), "should not average the cumulative counter");
+
+        let month = sql(Range::Month, AverageBasis::FixedDay);
+        assert!(month.contains("INTERVAL 29 DAY"), "30 whole calendar days");
+    }
+
+    #[test]
+    fn sql_basis_controls_denominator() {
+        let fixed = sql(Range::Week, AverageBasis::FixedDay);
+        assert!(fixed.contains("/ (24.0)"), "fixed basis divides by 24");
+        assert!(!fixed.contains("TIMESTAMPDIFF"));
+
+        let daylight = sql(Range::Week, AverageBasis::Daylight);
+        assert!(daylight.contains("TIMESTAMPDIFF"), "daylight basis divides by the reading span");
     }
 
     #[test]
     fn sql_year_windows_one_year_and_groups_by_month() {
-        let sql = build_sql(Range::Year, "readings", "invertertime", "wattsperhour");
-        assert!(sql.contains("INTERVAL 1 YEAR"));
-        assert!(sql.contains("MONTH(`invertertime`)"));
-        assert!(sql.contains("AVG("));
+        let s = sql(Range::Year, AverageBasis::FixedDay);
+        assert!(s.contains("INTERVAL 11 MONTH"), "12 whole calendar months");
+        assert!(s.contains("DATE_FORMAT(d, '%Y-%m')"));
+        assert!(s.contains("MAX(") && s.contains("SUM("), "month = sum of daily maxes");
     }
 
     #[test]
     fn sql_lifetime_has_no_time_filter() {
-        let sql = build_sql(Range::Lifetime, "readings", "invertertime", "wattsperhour");
-        assert!(!sql.contains("WHERE"), "lifetime should scan all rows");
-        assert!(sql.contains("GROUP BY YEAR"));
-        assert!(sql.contains("AVG("));
+        let s = sql(Range::Lifetime, AverageBasis::FixedDay);
+        assert!(!s.contains("WHERE"), "lifetime should scan all rows");
+        assert!(s.contains("DATE_FORMAT(d, '%Y-%m')"));
     }
 
     // ---- mock model ---------------------------------------------------------
@@ -614,42 +791,82 @@ mod tests {
         assert!(mock_day_kwh(NaiveDate::from_ymd_opt(2026, 6, 21).unwrap(), 15.0) > 0.0);
     }
 
+    const B: AverageBasis = AverageBasis::FixedDay;
+
     #[test]
     fn generate_mock_point_counts_per_range() {
-        assert_eq!(generate_mock(Range::Day, 15.0, 96).len(), 96);
-        assert_eq!(generate_mock(Range::Week, 15.0, 1000).len(), 7);
-        assert_eq!(generate_mock(Range::Month, 15.0, 1000).len(), 30);
-        assert_eq!(generate_mock(Range::Year, 15.0, 1000).len(), 12);
-        assert_eq!(generate_mock(Range::Lifetime, 15.0, 1000).len(), 18);
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 96).len(), 96);
+        assert_eq!(generate_mock(Range::Week, 15.0, B, 1000).len(), 7);
+        assert_eq!(generate_mock(Range::Month, 15.0, B, 1000).len(), 30);
+        assert_eq!(generate_mock(Range::Year, 15.0, B, 1000).len(), 12);
+        assert_eq!(generate_mock(Range::Lifetime, 15.0, B, 1000).len(), 18);
     }
 
     #[test]
-    fn generate_mock_day_limit_is_clamped() {
-        assert_eq!(generate_mock(Range::Day, 15.0, 0).len(), 1);
-        assert_eq!(generate_mock(Range::Day, 15.0, 10_000).len(), 5000);
+    fn generate_mock_day_is_one_full_calendar_day() {
+        // Full day at 15-min cadence = 96 points, regardless of a huge cap.
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 10_000).len(), 96);
+        // Cap keeps only the most recent `limit` points.
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 0).len(), 1);
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 10).len(), 10);
+        // Every point is on the same calendar day (shared MM-DD prefix).
+        let pts = generate_mock(Range::Day, 15.0, B, 10_000);
+        let first_day = pts[0].label[..5].to_string();
+        assert!(pts.iter().all(|p| p.label[..5] == first_day));
+    }
+
+    #[test]
+    fn interval_step_is_always_positive() {
+        assert_eq!(interval_step(0.5), Duration::seconds(30));
+        assert_eq!(interval_step(15.0), Duration::seconds(900));
+        assert!(interval_step(0.0) >= Duration::seconds(1));
+        assert!(interval_step(0.001) >= Duration::seconds(1));
+    }
+
+    #[test]
+    fn generate_mock_handles_fractional_interval_without_hanging() {
+        // A sub-minute interval must still terminate and respect the cap.
+        assert_eq!(generate_mock(Range::Day, 0.5, B, 50).len(), 50);
+        assert!(!generate_mock(Range::Week, 0.5, B, 1000).is_empty());
     }
 
     #[test]
     fn generate_mock_values_are_finite_and_nonnegative() {
-        for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
-            for p in generate_mock(r, 15.0, 1000) {
-                assert!(p.kwh.is_finite() && p.kwh >= 0.0, "{r:?} -> {p:?}");
-                assert!(!p.label.is_empty());
+        for basis in [AverageBasis::FixedDay, AverageBasis::Daylight] {
+            for r in [Range::Day, Range::Week, Range::Month, Range::Year, Range::Lifetime] {
+                for p in generate_mock(r, 15.0, basis, 1000) {
+                    assert!(p.kwh.is_finite() && p.kwh >= 0.0, "{r:?}/{basis:?} -> {p:?}");
+                    assert!(!p.label.is_empty());
+                }
             }
         }
     }
 
     #[test]
-    fn generate_mock_day_labels_are_hh_mm() {
-        for p in generate_mock(Range::Day, 15.0, 96) {
-            assert_eq!(p.label.len(), 5, "expected HH:MM, got {}", p.label);
-            assert_eq!(p.label.as_bytes()[2], b':');
+    fn generate_mock_day_is_cumulative_nondecreasing_within_day() {
+        // Cumulative kWh must never decrease within a single day.
+        let pts = generate_mock(Range::Day, 15.0, B, 96);
+        for w in pts.windows(2) {
+            // same day (labels share the "MM-DD" prefix) => non-decreasing
+            if w[0].label[..5] == w[1].label[..5] {
+                assert!(w[1].kwh >= w[0].kwh, "cumulative dropped: {:?} -> {:?}", w[0], w[1]);
+            }
         }
     }
 
     #[test]
+    fn generate_mock_daylight_basis_exceeds_fixed_for_aggregates() {
+        // Dividing by ~daylight hours (<24) yields a larger avg than /24.
+        let fixed: f64 = generate_mock(Range::Week, 15.0, AverageBasis::FixedDay, 1000)
+            .iter().map(|p| p.kwh).sum();
+        let daylight: f64 = generate_mock(Range::Week, 15.0, AverageBasis::Daylight, 1000)
+            .iter().map(|p| p.kwh).sum();
+        assert!(daylight > fixed, "daylight avg {daylight} should exceed fixed-24 avg {fixed}");
+    }
+
+    #[test]
     fn generate_mock_month_labels_are_year_month() {
-        for p in generate_mock(Range::Lifetime, 15.0, 1000) {
+        for p in generate_mock(Range::Lifetime, 15.0, B, 1000) {
             assert_eq!(p.label.len(), 7, "expected YYYY-MM, got {}", p.label);
             assert_eq!(p.label.as_bytes()[4], b'-');
         }
