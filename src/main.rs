@@ -360,26 +360,29 @@ fn generate_mock(
 ) -> Vec<ChartPoint> {
     let now = Local::now().naive_local();
     match range {
-        // Cumulative kWh rising through each day (counter resets at midnight).
+        // A single calendar day: cumulative kWh from midnight, capped to the
+        // most recent `limit` points (not used as a time range).
         Range::Day => {
-            let n = limit.clamp(1, 5000);
             let step = Duration::minutes(interval_minutes as i64);
-            let mut out = Vec::with_capacity(n as usize);
+            let start = now.date().and_hms_opt(0, 0, 0).unwrap();
+            let end = now.date().succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
+            let mut out = Vec::new();
             let mut cum = 0.0;
-            let mut cur_day = None;
-            for i in 0..n {
-                let ts = now - step * ((n - 1 - i) as i32);
-                if cur_day != Some(ts.date()) {
-                    cum = 0.0;
-                    cur_day = Some(ts.date());
-                }
-                cum += mock_interval_kwh(ts, interval_minutes);
+            let mut t = start;
+            while t < end {
+                cum += mock_interval_kwh(t, interval_minutes);
                 out.push(ChartPoint {
-                    label: ts.format("%m-%d %H:%M").to_string(),
+                    label: t.format("%m-%d %H:%M").to_string(),
                     kwh: round2(cum),
                 });
+                t += step;
             }
-            out
+            let cap = limit.clamp(1, 5000) as usize;
+            if out.len() > cap {
+                out.split_off(out.len() - cap)
+            } else {
+                out
+            }
         }
         Range::Week | Range::Month => {
             let days = if range == Range::Week { 7 } else { 30 };
@@ -465,32 +468,39 @@ fn day_hours_expr(ts: &str, basis: AverageBasis) -> String {
 /// interpolation is safe.
 fn build_sql(range: Range, table: &str, ts: &str, energy_col: &str, basis: AverageBasis) -> String {
     let e = format!("CAST(`{energy_col}` AS DOUBLE)");
-    let latest = format!("(SELECT MAX({ts}) FROM `{table}`)");
+    // Anchor windows to the newest *calendar date/month* in the table, aligned to
+    // day/month boundaries so a range yields exactly N full buckets (no partial
+    // leading day/month, no spurious extra bucket).
+    let latest_date = format!("(SELECT DATE(MAX({ts})) FROM `{table}`)");
+    let latest_month = format!("(SELECT DATE_FORMAT(MAX({ts}), '%Y-%m-01') FROM `{table}`)");
 
     match range {
+        // A single calendar day: the latest day's cumulative counter curve.
         Range::Day => format!(
             "SELECT DATE_FORMAT({ts}, '%m-%d %H:%i') AS label, \
                 COALESCE({e}, 0) / 1000.0 AS kwh \
              FROM `{table}` \
-             WHERE {ts} >= ({latest} - INTERVAL 1 DAY) \
+             WHERE DATE({ts}) = {latest_date} \
              ORDER BY {ts} ASC \
              LIMIT ?"
         ),
         Range::Week | Range::Month => {
-            let interval = if range == Range::Week { "7 DAY" } else { "30 DAY" };
+            // 7 or 30 whole calendar days ending on the latest date.
+            let back = if range == Range::Week { 6 } else { 29 };
             let denom = day_hours_expr(ts, basis);
             format!(
                 "SELECT DATE_FORMAT({ts}, '%Y-%m-%d') AS label, \
                     COALESCE(MAX({e}), 0) / 1000.0 / ({denom}) AS kwh \
                  FROM `{table}` \
-                 WHERE {ts} >= ({latest} - INTERVAL {interval}) \
+                 WHERE DATE({ts}) >= ({latest_date} - INTERVAL {back} DAY) \
                  GROUP BY DATE({ts}) \
                  ORDER BY DATE({ts}) ASC"
             )
         }
         Range::Year | Range::Lifetime => {
+            // 12 whole calendar months ending on the latest month.
             let where_clause = if range == Range::Year {
-                format!("WHERE {ts} >= ({latest} - INTERVAL 1 YEAR) ")
+                format!("WHERE {ts} >= ({latest_month} - INTERVAL 11 MONTH) ")
             } else {
                 String::new()
             };
@@ -693,7 +703,7 @@ mod tests {
         // All non-lifetime ranges base their window on MAX(ts), not NOW().
         for r in [Range::Day, Range::Week, Range::Month, Range::Year] {
             let s = sql(r, AverageBasis::FixedDay);
-            assert!(s.contains("SELECT MAX("), "{r:?} should window off the latest reading");
+            assert!(s.contains("MAX("), "{r:?} should window off the latest reading");
             assert!(!s.contains("NOW()"), "{r:?} must not use NOW()");
         }
     }
@@ -701,7 +711,8 @@ mod tests {
     #[test]
     fn sql_day_is_cumulative_with_limit() {
         let s = sql(Range::Day, AverageBasis::FixedDay);
-        assert!(s.contains("INTERVAL 1 DAY"));
+        assert!(s.contains("WHERE DATE("), "day view is a single calendar day");
+        assert!(s.contains("= (SELECT DATE(MAX("), "pinned to the latest date");
         assert!(s.contains("LIMIT ?"));
         assert!(s.contains("/ 1000.0"));
         assert!(!s.contains("GROUP BY"), "day view is per-reading, not aggregated");
@@ -710,13 +721,13 @@ mod tests {
     #[test]
     fn sql_week_and_month_use_daily_max() {
         let week = sql(Range::Week, AverageBasis::FixedDay);
-        assert!(week.contains("INTERVAL 7 DAY"));
+        assert!(week.contains("INTERVAL 6 DAY"), "7 whole calendar days");
         assert!(week.contains("GROUP BY DATE("));
         assert!(week.contains("MAX("), "daily production is the counter MAX");
         assert!(!week.contains("AVG("), "should not average the cumulative counter");
 
         let month = sql(Range::Month, AverageBasis::FixedDay);
-        assert!(month.contains("INTERVAL 30 DAY"));
+        assert!(month.contains("INTERVAL 29 DAY"), "30 whole calendar days");
     }
 
     #[test]
@@ -732,7 +743,7 @@ mod tests {
     #[test]
     fn sql_year_windows_one_year_and_groups_by_month() {
         let s = sql(Range::Year, AverageBasis::FixedDay);
-        assert!(s.contains("INTERVAL 1 YEAR"));
+        assert!(s.contains("INTERVAL 11 MONTH"), "12 whole calendar months");
         assert!(s.contains("DATE_FORMAT(d, '%Y-%m')"));
         assert!(s.contains("MAX(") && s.contains("SUM("), "month = sum of daily maxes");
     }
@@ -785,9 +796,16 @@ mod tests {
     }
 
     #[test]
-    fn generate_mock_day_limit_is_clamped() {
+    fn generate_mock_day_is_one_full_calendar_day() {
+        // Full day at 15-min cadence = 96 points, regardless of a huge cap.
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 10_000).len(), 96);
+        // Cap keeps only the most recent `limit` points.
         assert_eq!(generate_mock(Range::Day, 15.0, B, 0).len(), 1);
-        assert_eq!(generate_mock(Range::Day, 15.0, B, 10_000).len(), 5000);
+        assert_eq!(generate_mock(Range::Day, 15.0, B, 10).len(), 10);
+        // Every point is on the same calendar day (shared MM-DD prefix).
+        let pts = generate_mock(Range::Day, 15.0, B, 10_000);
+        let first_day = pts[0].label[..5].to_string();
+        assert!(pts.iter().all(|p| p.label[..5] == first_day));
     }
 
     #[test]

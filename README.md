@@ -154,22 +154,22 @@ isn't backed by real rows.
 
 ### Mock data in a real database
 
-If you'd rather load sample rows into an actual MySQL database, use the seed
-script. It creates the `readings` table and inserts a solar curve for the last
-3 days at 15-minute intervals:
+If you'd rather load sample rows into an actual MySQL/MariaDB database, use the
+seed script. It creates the `solarpower` table (the default `TABLE_NAME`) with
+the same shape as the real inverter export — a **cumulative daily**
+`wattsperhour` counter and an ISO-8601 `invertertime` string — and fills it with
+a solar curve for the last 3 days at 10-minute intervals:
 
 ```sh
 mysql -u <user> -p <database> < seed.sql
 ```
 
-(Requires MySQL 8.0+ or MariaDB 10.2+. Edit `seed.sql` to change the date range
-or interval.)
+With the default `.env` (`TABLE_NAME=solarpower`, `PARSE_ISO_TIME=true`) the app
+works against this seed with no extra configuration.
 
-**Note on re-seeding**: If you run the seed script multiple times, you may need
-to drop the index first to avoid duplicate index errors:
-```sh
-mysql -u <user> -p <database> -e "DROP INDEX idx_invertertime ON readings;"
-```
+(Requires MySQL 8.0+ or MariaDB 10.2+. Edit `seed.sql` to change the date range
+or interval. Re-seeding appends rows; `TRUNCATE TABLE solarpower;` first for a
+clean slate.)
 
 ## Running
 
