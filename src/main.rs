@@ -281,9 +281,16 @@ fn mock_interval_kwh(ts: NaiveDateTime, interval_minutes: f64) -> f64 {
     mock_watts(ts) / 1000.0 * (interval_minutes / 60.0)
 }
 
+/// A strictly-positive step duration, preserving fractional minutes. Guards the
+/// mock loops against a zero-length step (e.g. `INTERVAL_MINUTES=0.5` would
+/// truncate to 0 minutes and loop forever).
+fn interval_step(interval_minutes: f64) -> Duration {
+    Duration::seconds(((interval_minutes * 60.0).round() as i64).max(1))
+}
+
 /// Total energy (kWh) produced on a given calendar day.
 fn mock_day_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
-    let step = Duration::minutes(interval_minutes as i64);
+    let step = interval_step(interval_minutes);
     let mut t = date.and_hms_opt(0, 0, 0).unwrap();
     let end = date
         .succ_opt()
@@ -300,7 +307,7 @@ fn mock_day_kwh(date: NaiveDate, interval_minutes: f64) -> f64 {
 
 /// Daylight span (hours where power > 0) for a day in the mock model.
 fn mock_daylight_hours(date: NaiveDate, interval_minutes: f64) -> f64 {
-    let step = Duration::minutes(interval_minutes as i64);
+    let step = interval_step(interval_minutes);
     let mut t = date.and_hms_opt(0, 0, 0).unwrap();
     let end = date.succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
     let (mut first, mut last) = (None, None);
@@ -363,7 +370,7 @@ fn generate_mock(
         // A single calendar day: cumulative kWh from midnight, capped to the
         // most recent `limit` points (not used as a time range).
         Range::Day => {
-            let step = Duration::minutes(interval_minutes as i64);
+            let step = interval_step(interval_minutes);
             let start = now.date().and_hms_opt(0, 0, 0).unwrap();
             let end = now.date().succ_opt().unwrap().and_hms_opt(0, 0, 0).unwrap();
             let mut out = Vec::new();
@@ -806,6 +813,21 @@ mod tests {
         let pts = generate_mock(Range::Day, 15.0, B, 10_000);
         let first_day = pts[0].label[..5].to_string();
         assert!(pts.iter().all(|p| p.label[..5] == first_day));
+    }
+
+    #[test]
+    fn interval_step_is_always_positive() {
+        assert_eq!(interval_step(0.5), Duration::seconds(30));
+        assert_eq!(interval_step(15.0), Duration::seconds(900));
+        assert!(interval_step(0.0) >= Duration::seconds(1));
+        assert!(interval_step(0.001) >= Duration::seconds(1));
+    }
+
+    #[test]
+    fn generate_mock_handles_fractional_interval_without_hanging() {
+        // A sub-minute interval must still terminate and respect the cap.
+        assert_eq!(generate_mock(Range::Day, 0.5, B, 50).len(), 50);
+        assert!(!generate_mock(Range::Week, 0.5, B, 1000).is_empty());
     }
 
     #[test]
